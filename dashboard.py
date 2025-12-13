@@ -1,7 +1,4 @@
 import streamlit as st
-import paho.mqtt.client as mqtt
-import paho.mqtt.client as mqtt
-from paho.mqtt.enums import CallbackAPIVersion
 import json
 import time
 import pandas as pd
@@ -16,7 +13,9 @@ from pymavlink import mavutil
 load_dotenv()
 
 # Configuration
-DASHBOARD_SOURCE = os.getenv("DASHBOARD_SOURCE", "MQTT").upper()
+
+# Only MAVLINK is supported
+DASHBOARD_SOURCE = "MAVLINK"
 MAVLINK_ENDPOINT = os.getenv("MAVLINK_ENDPOINT", "udpin:0.0.0.0:14550")
 
 MQTT_BROKER = os.getenv("MQTT_HOST", "localhost")
@@ -95,6 +94,7 @@ class SharedState:
         with self.lock:
             self.rover_data.update(data)
             self.last_update = time.time()
+            print(f"[DEBUG] last_update set to {self.last_update} ({time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.last_update))})")
 
     def set_mission(self, points):
         with self.lock:
@@ -119,7 +119,9 @@ class SharedState:
 
     def get(self):
         with self.lock:
-            return self.rover_data.copy()
+            data = self.rover_data.copy()
+            data['last_update'] = self.last_update
+            return data
 
 @st.cache_resource
 def get_shared_state():
@@ -244,57 +246,27 @@ def start_mavlink_client():
         st.error(f"Failed to connect to MAVLink: {e}")
         return None
 
-    # Removed MQTT Client Setup (Cached Resource)
-    # @st.cache_resource
-    # def start_mqtt_client():
-    #     client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2)
-    #     
-    #     if MQTT_USERNAME and MQTT_PASSWORD:
-    #         client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-    #         
-    #     client.on_message = on_message
-    #     
-    #     try:
-    #         client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    #         client.subscribe(MQTT_TOPIC)
-    #         client.loop_start()
-    #         return client
-    #     except Exception as e:
-    #         st.error(f"Failed to connect to MQTT Broker: {e}")
-    #         return None
-
-# Start Client based on config
-
-if DASHBOARD_SOURCE == "MAVLINK":
-    client = start_mavlink_client()
-    mavlink_data_seen = False
-    if client:
-        # Check for any recent MAVLink data in shared state
-        data = get_shared_state().get()
-        import time
-        now = time.time()
-        # Use last_update timestamp for any data
-        last_update = data.get('last_update', 0) if data else 0
-        if last_update and (now - last_update) < 3:
-            mavlink_data_seen = True
-        tx_endpoint = os.getenv("MAVLINK_TX_ENDPOINT", "N/A")
-        if mavlink_data_seen:
-            st.sidebar.success(f"Connected to MAVLink: {MAVLINK_ENDPOINT}\nTX: {tx_endpoint}")
-        else:
-            st.sidebar.error(f"No MAVLink data!\nTX: {tx_endpoint}")
-    # Removed MQTT client connection logic
-    # else:
-    #     client = start_mqtt_client()
-    #     if client:
-    #         st.sidebar.success(f"Connected to MQTT Broker at {MQTT_BROKER}:{MQTT_PORT}")
-    #         st.sidebar.info(f"Subscribed to: {MQTT_TOPIC}")
-
-if client is None:
+# Start MAVLink client
+client = start_mavlink_client()
+mavlink_data_seen = False
+if client:
+    # Check for any recent MAVLink data in shared state
+    data = get_shared_state().get()
+    import time
+    now = time.time()
+    last_update = data.get('last_update', 0) if data else 0
+#    print(f"[DEBUG] Checking last_update: now={now}, last_update={last_update}, delta={now - last_update if last_update else 'N/A'}")
+    if last_update and (now - last_update) < 3:
+        mavlink_data_seen = True
+    mavlink_endpoint = os.getenv("MAVLINK_ENDPOINT", "N/A")
+    if mavlink_data_seen:
+        st.sidebar.success(f"Connected to MAVLink:\n: {mavlink_endpoint}")
+    else:
+        st.sidebar.error(f"No MAVLink data!\n: {mavlink_endpoint}")
+else:
     st.stop()
 
 # Layout
-
-
 
 st.markdown('<hr style="border:0;border-top:2px solid #fff;margin:8px 0 8px 0;">', unsafe_allow_html=True)
 # Stats row (now with white line above)
@@ -323,7 +295,7 @@ col_btn1, col_btn2, col_btn3, col_btn4, col_btn5, col_btn6, col_btn7, col_btn8, 
 with col_btn1:
     if st.button("Auto"):
         try:
-            if DASHBOARD_SOURCE == "MAVLINK" and client:
+            if client:
                 # Set mode to AUTO (mode number 10 for Rover)
                 client.mav.set_mode_send(
                     client.target_system,
@@ -338,7 +310,7 @@ with col_btn1:
 with col_btn2:
     if st.button("Hold"):
         try:
-            if DASHBOARD_SOURCE == "MAVLINK" and client:
+            if client:
                 # Set mode to HOLD (mode number 4 for Rover)
                 client.mav.set_mode_send(
                     client.target_system,
@@ -353,7 +325,7 @@ with col_btn2:
 with col_btn3:
     if st.button("Manual"):
         try:
-            if DASHBOARD_SOURCE == "MAVLINK" and client:
+            if client:
                 # Set mode to MANUAL (mode number 0 for Rover)
                 client.mav.set_mode_send(
                     client.target_system,
@@ -371,7 +343,7 @@ with col_btn4:
 with col_btn5:
     if st.button("Skip WP"):
         try:
-            if DASHBOARD_SOURCE == "MAVLINK" and client:
+            if client:
                 # Advance to next waypoint
                 # Use current WP from shared state, increment, and send mission_set_current
                 data = get_shared_state().get()
@@ -392,7 +364,7 @@ with col_btn5:
 with col_btn6:
     if st.button("Arm"):
         try:
-            if DASHBOARD_SOURCE == "MAVLINK" and client:
+            if client:
                 client.mav.command_long_send(
                     client.target_system,
                     client.target_component,
@@ -408,7 +380,7 @@ with col_btn6:
 with col_btn7:
     if st.button("Disarm"):
         try:
-            if DASHBOARD_SOURCE == "MAVLINK" and client:
+            if client:
                 client.mav.command_long_send(
                     client.target_system,
                     client.target_component,
@@ -428,7 +400,7 @@ with col_btn8:
         st.button("Loading...", disabled=True)
     else:
         if st.button("Load Map"):
-            if DASHBOARD_SOURCE == "MAVLINK" and client:
+            if client:
                 try:
                     get_shared_state().set_loading(True)
                     # Request mission list
@@ -447,7 +419,7 @@ with col_btn9:
     armed = data.get('armed', False)
     if st.button("Reboot", disabled=armed):
         try:
-            if DASHBOARD_SOURCE == "MAVLINK" and client:
+            if client:
                 client.mav.command_long_send(
                     client.target_system,
                     client.target_component,
