@@ -1,3 +1,81 @@
+import base64
+import socket
+# ...existing code...
+import streamlit as st
+import json
+import time
+import pydeck as pdk
+import math
+from dotenv import load_dotenv
+import os
+import threading
+from pymavlink import mavutil
+
+# Sidebar enclosure for Missions (must be after st import)
+with st.sidebar.expander('Missions', expanded=True):
+    missions_dir = os.path.join(os.path.dirname(__file__), 'missions')
+    try:
+        files = os.listdir(missions_dir)
+        # Remove hidden files, periods, and extensions
+        missions = []
+        for f in files:
+            if not f.startswith('.'):
+                base = os.path.splitext(f)[0].replace('.', '')
+                path = os.path.join(missions_dir, f)
+                try:
+                    ts = os.path.getmtime(path)
+                    import datetime
+                    ts_str = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    ts_str = '?'
+                missions.append((base, ts_str))
+        if missions:
+            st.write('Available missions:')
+            for name, ts in missions:
+                st.write(f'- {name} [{ts}]')
+        else:
+            st.write('No missions found.')
+        # Add Load button at the bottom
+        if st.button('Load', key='load_mission_button'):
+            st.write('Load button pressed!')
+    except Exception as e:
+        st.write(f'Error reading missions: {e}')
+
+
+
+# NTRIP connection state (global)
+NTRIP_CASTER = os.getenv("NTRIP_CASTER", "")
+NTRIP_PORT = int(os.getenv("NTRIP_PORT", 2101))
+NTRIP_MOUNTPOINT = os.getenv("NTRIP_MOUNTPOINT", "")
+NTRIP_USER = os.getenv("NTRIP_USER", "")
+NTRIP_PASS = os.getenv("NTRIP_PASS", "")
+NTRIP_CONNECTED = {'status': False, 'rtcm_count': 0}
+
+def start_ntrip_injection(conn):
+    """
+    Starts a background thread to fetch RTCM3 data from an NTRIP caster and inject it into MAVLink.
+    """
+    def ntrip_thread():
+        if not (NTRIP_CASTER and NTRIP_MOUNTPOINT and NTRIP_USER and NTRIP_PASS):
+            print("[NTRIP] Missing NTRIP configuration, skipping NTRIP injection.")
+            NTRIP_CONNECTED['status'] = False
+            return
+        try:
+            print(f"[NTRIP] Connecting to {NTRIP_CASTER}:{NTRIP_PORT}/{NTRIP_MOUNTPOINT}")
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10)
+            s.connect((NTRIP_CASTER, NTRIP_PORT))
+            # NTRIP request
+            print(f"[NTRIP] Sending NTRIP request...")
+            auth = base64.b64encode(f"{NTRIP_USER}:{NTRIP_PASS}".encode()).decode()
+            # ...existing NTRIP logic continues here...
+        except Exception as e:
+            print(f"[NTRIP] Error: {e}")
+            NTRIP_CONNECTED['status'] = False
+
+    t = threading.Thread(target=ntrip_thread, daemon=True)
+    t.start()
+
 import streamlit as st
 import json
 import time
@@ -8,6 +86,14 @@ from dotenv import load_dotenv
 import os
 import threading
 from pymavlink import mavutil
+
+# NTRIP connection state (global)
+NTRIP_CASTER = os.getenv("NTRIP_CASTER", "")
+NTRIP_PORT = int(os.getenv("NTRIP_PORT", 2101))
+NTRIP_MOUNTPOINT = os.getenv("NTRIP_MOUNTPOINT", "")
+NTRIP_USER = os.getenv("NTRIP_USER", "")
+NTRIP_PASS = os.getenv("NTRIP_PASS", "")
+NTRIP_CONNECTED = {'status': False}
 
 # Load environment variables
 load_dotenv()
@@ -94,7 +180,7 @@ class SharedState:
         with self.lock:
             self.rover_data.update(data)
             self.last_update = time.time()
-            print(f"[DEBUG] last_update set to {self.last_update} ({time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.last_update))})")
+#            print(f"[DEBUG] last_update set to {self.last_update} ({time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.last_update))})")
 
     def set_mission(self, points):
         with self.lock:
@@ -246,8 +332,70 @@ def start_mavlink_client():
         st.error(f"Failed to connect to MAVLink: {e}")
         return None
 
-# Start MAVLink client
-client = start_mavlink_client()
+mavlink_conn = start_mavlink_client()
+
+
+# Sidebar enclosure for Missions (must be after st import)
+with st.sidebar.expander('Missions', expanded=False):
+    missions_dir = os.path.join(os.path.dirname(__file__), 'missions')
+    try:
+        files = os.listdir(missions_dir)
+        # Remove hidden files, periods, and extensions
+        missions = []
+        for f in files:
+            if not f.startswith('.'):
+                base = os.path.splitext(f)[0].replace('.', '')
+                path = os.path.join(missions_dir, f)
+                try:
+                    ts = os.path.getmtime(path)
+                    import datetime
+                    ts_str = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    ts_str = '?'
+                missions.append((base, ts_str))
+        if missions:
+            #st.write('Available missions:')
+            for name, ts in missions:
+                st.write(f'- {name} [{ts}]')
+        else:
+            st.write('No missions found.')
+    except Exception as e:
+        st.write(f'Error reading missions: {e}')
+
+# # Sidebar enclosure for Missions
+# import os
+# with st.sidebar.expander('Missions', expanded=True):
+#     missions_dir = os.path.join(os.path.dirname(__file__), 'missions')
+#     try:
+#         files = os.listdir(missions_dir)
+#         # Remove hidden files, periods, and extensions
+#         mission_names = [os.path.splitext(f)[0].replace('.', '') for f in files if not f.startswith('.')]
+#         if mission_names:
+#            # st.write('Available missions:')
+#             for name in mission_names:
+#                 st.write(f'- {name}')
+#         else:
+#             st.write('No missions found.')
+#     except Exception as e:
+#         st.write(f'Error reading missions: {e}')
+
+# Sidebar: NTRIP enable checkbox and status
+if 'ntrip_enabled' not in st.session_state:
+    st.session_state['ntrip_enabled'] = False
+st.sidebar.markdown('---')
+st.session_state['ntrip_enabled'] = st.sidebar.checkbox('Enable NTRIP injection', value=st.session_state['ntrip_enabled'])
+if mavlink_conn and st.session_state['ntrip_enabled']:
+    if not NTRIP_CONNECTED['status']:
+        start_ntrip_injection(mavlink_conn)
+    if NTRIP_CONNECTED['status']:
+        st.sidebar.success(f'NTRIP: Connected ({NTRIP_CONNECTED["rtcm_count"]} RTCM packets)')
+    else:
+        st.sidebar.warning('NTRIP: Not connected')
+else:
+    st.sidebar.info('NTRIP: Disabled')
+
+
+client = mavlink_conn
 mavlink_data_seen = False
 if client:
     # Check for any recent MAVLink data in shared state
