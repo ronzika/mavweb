@@ -1,6 +1,162 @@
 import base64
 import socket
+# For settings page
+import re
+from pathlib import Path
 # ...existing code...
+import streamlit as st
+import os
+# ...existing code...
+
+# --- Settings Page ---
+def load_env_example():
+    env_path = Path(__file__).parent / '.env'
+    env_vars = {}
+    if env_path.exists():
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                match = re.match(r'([A-Za-z0-9_]+)=(.*)', line)
+                if match:
+                    key, value = match.groups()
+                    env_vars[key] = value
+    return env_vars
+
+def save_env_vars(new_vars):
+    env_path = Path(__file__).parent / '.env'
+    with open(env_path, 'w') as f:
+        for k, v in new_vars.items():
+            f.write(f'{k}={v}\n')
+
+def settings_page():
+    st.title('Settings')
+    st.info('Edit and save environment variables. Changes will be written to .env.')
+    env_vars = load_env_example()
+    current = {k: st.session_state.get(f'env_{k}', v) for k, v in env_vars.items()}
+    with st.form('env_form'):
+        new_vars = {}
+        for k, v in env_vars.items():
+            new_vars[k] = st.text_input(k, value=current[k], key=f'env_{k}')
+        submitted = st.form_submit_button('Save')
+        if submitted:
+            save_env_vars(new_vars)
+            st.success('.env updated! Please restart the app to apply changes.')
+
+# --- Streamlit Page Routing ---
+page = st.sidebar.radio('Pages', ['Dashboard', 'Missions', 'Settings'])
+
+def missions_page():
+    st.title('Missions')
+    missions_dir = os.path.join(os.path.dirname(__file__), 'missions')
+    st.subheader('Upload Missions')
+    uploaded_files = st.file_uploader(
+        'Upload .waypoints files',
+        type=['waypoints'],
+        accept_multiple_files=True,
+        key='missions_upload_dialog'
+    )
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            save_path = os.path.join(missions_dir, uploaded_file.name)
+            with open(save_path, 'wb') as f:
+                f.write(uploaded_file.read())
+        st.success(f"Uploaded {len(uploaded_files)} mission(s). Reload the page to see them in the table.")
+
+    try:
+        files = os.listdir(missions_dir)
+        missions = []
+        for f in files:
+            if not f.startswith('.'):
+                base = os.path.splitext(f)[0].replace('.', '')
+                path = os.path.join(missions_dir, f)
+                try:
+                    ts = os.path.getmtime(path)
+                    import datetime
+                    ts_str = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    ts_str = '?'
+                missions.append({'Mission': base, 'Timestamp': ts_str, 'Filename': f, 'Path': path})
+        if missions:
+            import pandas as pd
+            df = pd.DataFrame(missions)
+            selected = st.radio('Select a mission to preview:', df['Mission'] + ' (' + df['Filename'] + ')')
+            sel_row = df[df['Mission'] + ' (' + df['Filename'] + ')' == selected].iloc[0]
+            st.dataframe(df[['Mission', 'Timestamp', 'Filename']], hide_index=True)
+            # Preview selected mission
+            st.subheader(f"Preview: {sel_row['Mission']} ({sel_row['Filename']})")
+            # Try to parse the .waypoints file as lat/lon pairs per line
+            try:
+                with open(sel_row['Path']) as f:
+                    all_lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+                # Skip the first 2 lines (headers/metadata)
+                lines = all_lines[2:]
+                points = []
+                for line in lines:
+                    cols = line.split('\t')
+                    if len(cols) >= 10:
+                        try:
+                            lat = float(cols[8])
+                            lon = float(cols[9])
+                            points.append({'lat': lat, 'lon': lon})
+                        except Exception:
+                            continue
+                if points:
+                    import pydeck as pdk
+                    # Use same settings as main map
+                    # Convert to [[lon, lat], ...] for path, and for waypoints
+                    path_points = [[p['lon'], p['lat']] for p in points]
+                    waypoint_data = [{"pos": [p['lon'], p['lat']], "color": [255, 255, 255, 255]} for p in points]
+                    view_state = pdk.ViewState(
+                        latitude=points[0]['lat'],
+                        longitude=points[0]['lon'],
+                        zoom=20,
+                        pitch=0,
+                    )
+                    layers = []
+                    # Path (white, like pending)
+                    if len(path_points) > 1:
+                        layers.append(pdk.Layer(
+                            "PathLayer",
+                            data=[{"path": path_points}],
+                            get_path="path",
+                            get_color=[255, 255, 255, 200],
+                            width_min_pixels=1,
+                            get_width=0.05,
+                            width_units='"meters"',
+                            dash_justified=True,
+                        ))
+                    # Waypoints (white dots)
+                    layers.append(pdk.Layer(
+                        "ScatterplotLayer",
+                        data=waypoint_data,
+                        get_position="pos",
+                        get_color="color",
+                        get_radius=0.15,
+                        radius_units='"meters"',
+                    ))
+                    deck = pdk.Deck(
+                        initial_view_state=view_state,
+                        layers=layers,
+                        tooltip=True
+                    )
+                    st.pydeck_chart(deck)
+                else:
+                    st.info('No valid points found in this mission file.')
+            except Exception as e:
+                st.error(f'Could not parse or render mission: {e}')
+        else:
+            st.info('No missions found.')
+    except Exception as e:
+        st.error(f'Error reading missions: {e}')
+
+if page == 'Settings':
+    settings_page()
+    st.stop()
+elif page == 'Missions':
+    missions_page()
+    st.stop()
 import streamlit as st
 import json
 import time
@@ -45,42 +201,6 @@ st.markdown("""
     }
     </style>
 """, unsafe_allow_html=True)
-
-# Sidebar enclosure for Missions (must be after st import)
-with st.sidebar.expander('Missions', expanded=True):
-    missions_dir = os.path.join(os.path.dirname(__file__), 'missions')
-    try:
-        files = os.listdir(missions_dir)
-        # Remove hidden files, periods, and extensions
-        missions = []
-        for f in files:
-            if not f.startswith('.'):
-                base = os.path.splitext(f)[0].replace('.', '')
-                path = os.path.join(missions_dir, f)
-                try:
-                    ts = os.path.getmtime(path)
-                    import datetime
-                    ts_str = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
-                except Exception:
-                    ts_str = '?'
-                missions.append((base, ts_str))
-        if missions:
-           # st.write('Available missions:')
-            for idx, (name, ts) in enumerate(missions):
-                checked = st.checkbox(f'{name} [{ts}]', key=f'mission_{idx}')
-        else:
-            st.write('No missions found.')
-        # Add Load button at the bottom
-        if st.button('Load', key='load_mission_button'):
-            st.write('Load button pressed!')
-        # Upload button below Load
-        uploaded_file = st.file_uploader('Upload', key='upload_mission_button')
-        if uploaded_file is not None:
-            st.write(f'Uploaded: {uploaded_file.name}')
-    except Exception as e:
-        st.write(f'Error reading missions: {e}')
-
-
 
 # NTRIP connection state (global)
 NTRIP_CASTER = os.getenv("NTRIP_CASTER", "")
