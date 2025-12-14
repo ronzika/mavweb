@@ -1,21 +1,12 @@
 import base64
 import socket
+# For settings page
 import re
 from pathlib import Path
+# ...existing code...
 import streamlit as st
 import os
-import streamlit as st
-import json
-import time
-import pydeck as pdk
-import math
-from dotenv import load_dotenv
-import os
-import threading
-from pymavlink import mavutil
-
-load_dotenv()
-MAVLINK_ENDPOINT = os.getenv("MAVLINK_ENDPOINT", "udpin:0.0.0.0:14550")
+# ...existing code...
 
 # --- Settings Page ---
 def load_env_example():
@@ -51,12 +42,10 @@ def settings_page():
         submitted = st.form_submit_button('Save')
         if submitted:
             save_env_vars(new_vars)
-            st.session_state['Pages'] = 'Dashboard'
-            st.success('.env updated! Reloading app...')
-            st.rerun()
+            st.success('.env updated! Please restart the app to apply changes.')
 
 # --- Streamlit Page Routing ---
-page = st.sidebar.radio('Pages', ['Dashboard', 'Missions', 'Settings'], key='Pages')
+page = st.sidebar.radio('Pages', ['Dashboard', 'Missions', 'Settings'])
 
 def missions_page():
     st.title('Missions')
@@ -168,7 +157,20 @@ if page == 'Settings':
 elif page == 'Missions':
     missions_page()
     st.stop()
-    
+import streamlit as st
+import json
+import time
+import pydeck as pdk
+import math
+from dotenv import load_dotenv
+import os
+import threading
+from pymavlink import mavutil
+
+load_dotenv()
+MAVLINK_ENDPOINT = os.getenv("MAVLINK_ENDPOINT", "udpin:0.0.0.0:14550")
+
+
 st.set_page_config(page_title="Rover Dashboard", layout="wide")
 st.sidebar.title("Rover Dashboard")
 # Center metric labels using custom CSS
