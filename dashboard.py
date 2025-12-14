@@ -11,6 +11,41 @@ import os
 import threading
 from pymavlink import mavutil
 
+load_dotenv()
+MAVLINK_ENDPOINT = os.getenv("MAVLINK_ENDPOINT", "udpin:0.0.0.0:14550")
+
+
+st.set_page_config(page_title="Rover Dashboard", layout="wide")
+st.sidebar.title("Rover Dashboard")
+# Center metric labels using custom CSS
+st.markdown("""
+    <style>
+    div[data-testid="stMetric"] > label, div[data-testid="stMetric"] > div > label {
+        display: block;
+        text-align: center !important;
+        width: 100%;
+        margin-left: auto;
+        margin-right: auto;
+    }
+    /* For Streamlit >=1.30, metric label is in a div with role=heading */
+    div[data-testid="stMetric"] [role="heading"] {
+        text-align: center !important;
+        width: 100%;
+        margin-left: auto;
+        margin-right: auto;
+    }
+    /* Reduce font size and center metric value/statistic only */
+    div[data-testid="stMetric"] > div > div {
+        text-align: center !important;
+        width: 100%;
+        margin-left: auto;
+        margin-right: auto;
+        font-size: 1.05rem !important;
+        font-weight: 500;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
 # Sidebar enclosure for Missions (must be after st import)
 with st.sidebar.expander('Missions', expanded=True):
     missions_dir = os.path.join(os.path.dirname(__file__), 'missions')
@@ -30,14 +65,18 @@ with st.sidebar.expander('Missions', expanded=True):
                     ts_str = '?'
                 missions.append((base, ts_str))
         if missions:
-            st.write('Available missions:')
-            for name, ts in missions:
-                st.write(f'- {name} [{ts}]')
+           # st.write('Available missions:')
+            for idx, (name, ts) in enumerate(missions):
+                checked = st.checkbox(f'{name} [{ts}]', key=f'mission_{idx}')
         else:
             st.write('No missions found.')
         # Add Load button at the bottom
         if st.button('Load', key='load_mission_button'):
             st.write('Load button pressed!')
+        # Upload button below Load
+        uploaded_file = st.file_uploader('Upload', key='upload_mission_button')
+        if uploaded_file is not None:
+            st.write(f'Uploaded: {uploaded_file.name}')
     except Exception as e:
         st.write(f'Error reading missions: {e}')
 
@@ -76,72 +115,6 @@ def start_ntrip_injection(conn):
     t = threading.Thread(target=ntrip_thread, daemon=True)
     t.start()
 
-import streamlit as st
-import json
-import time
-import pandas as pd
-import pydeck as pdk
-import math
-from dotenv import load_dotenv
-import os
-import threading
-from pymavlink import mavutil
-
-# NTRIP connection state (global)
-NTRIP_CASTER = os.getenv("NTRIP_CASTER", "")
-NTRIP_PORT = int(os.getenv("NTRIP_PORT", 2101))
-NTRIP_MOUNTPOINT = os.getenv("NTRIP_MOUNTPOINT", "")
-NTRIP_USER = os.getenv("NTRIP_USER", "")
-NTRIP_PASS = os.getenv("NTRIP_PASS", "")
-NTRIP_CONNECTED = {'status': False}
-
-# Load environment variables
-load_dotenv()
-
-# Configuration
-
-# Only MAVLINK is supported
-DASHBOARD_SOURCE = "MAVLINK"
-MAVLINK_ENDPOINT = os.getenv("MAVLINK_ENDPOINT", "udpin:0.0.0.0:14550")
-
-MQTT_BROKER = os.getenv("MQTT_HOST", "localhost")
-MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
-MQTT_USERNAME = os.getenv("MQTT_USERNAME")
-MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
-MQTT_TOPIC_PREFIX = os.getenv("MQTT_TOPIC_PREFIX", "mavinject").rstrip('/')
-MQTT_TOPIC = f"{MQTT_TOPIC_PREFIX}/status"
-
-
-st.set_page_config(page_title="Rover Dashboard", layout="wide")
-st.sidebar.title("Rover Dashboard")
-# Center metric labels using custom CSS
-st.markdown("""
-    <style>
-    div[data-testid="stMetric"] > label, div[data-testid="stMetric"] > div > label {
-        display: block;
-        text-align: center !important;
-        width: 100%;
-        margin-left: auto;
-        margin-right: auto;
-    }
-    /* For Streamlit >=1.30, metric label is in a div with role=heading */
-    div[data-testid="stMetric"] [role="heading"] {
-        text-align: center !important;
-        width: 100%;
-        margin-left: auto;
-        margin-right: auto;
-    }
-    /* Reduce font size and center metric value/statistic only */
-    div[data-testid="stMetric"] > div > div {
-        text-align: center !important;
-        width: 100%;
-        margin-left: auto;
-        margin-right: auto;
-        font-size: 1.05rem !important;
-        font-weight: 500;
-    }
-    </style>
-""", unsafe_allow_html=True)
 
 # Log client IP
 if 'ip_logged' not in st.session_state:
@@ -334,50 +307,6 @@ def start_mavlink_client():
 
 mavlink_conn = start_mavlink_client()
 
-
-# Sidebar enclosure for Missions (must be after st import)
-with st.sidebar.expander('Missions', expanded=False):
-    missions_dir = os.path.join(os.path.dirname(__file__), 'missions')
-    try:
-        files = os.listdir(missions_dir)
-        # Remove hidden files, periods, and extensions
-        missions = []
-        for f in files:
-            if not f.startswith('.'):
-                base = os.path.splitext(f)[0].replace('.', '')
-                path = os.path.join(missions_dir, f)
-                try:
-                    ts = os.path.getmtime(path)
-                    import datetime
-                    ts_str = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
-                except Exception:
-                    ts_str = '?'
-                missions.append((base, ts_str))
-        if missions:
-            #st.write('Available missions:')
-            for name, ts in missions:
-                st.write(f'- {name} [{ts}]')
-        else:
-            st.write('No missions found.')
-    except Exception as e:
-        st.write(f'Error reading missions: {e}')
-
-# # Sidebar enclosure for Missions
-# import os
-# with st.sidebar.expander('Missions', expanded=True):
-#     missions_dir = os.path.join(os.path.dirname(__file__), 'missions')
-#     try:
-#         files = os.listdir(missions_dir)
-#         # Remove hidden files, periods, and extensions
-#         mission_names = [os.path.splitext(f)[0].replace('.', '') for f in files if not f.startswith('.')]
-#         if mission_names:
-#            # st.write('Available missions:')
-#             for name in mission_names:
-#                 st.write(f'- {name}')
-#         else:
-#             st.write('No missions found.')
-#     except Exception as e:
-#         st.write(f'Error reading missions: {e}')
 
 # Sidebar: NTRIP enable checkbox and status
 if 'ntrip_enabled' not in st.session_state:
