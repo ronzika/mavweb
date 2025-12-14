@@ -17,6 +17,10 @@ from pymavlink import mavutil
 load_dotenv()
 MAVLINK_ENDPOINT = os.getenv("MAVLINK_ENDPOINT", "udpin:0.0.0.0:14550")
 
+st.set_page_config(page_title="Rover Dashboard", layout="wide")
+st.sidebar.title("Rover Dashboard")
+st.sidebar.markdown('---')
+
 # --- Settings Page ---
 def load_env_example():
     env_path = Path(__file__).parent / '.env'
@@ -169,9 +173,7 @@ elif page == 'Missions':
     missions_page()
     st.stop()
     
-st.set_page_config(page_title="Rover Dashboard", layout="wide")
-st.sidebar.title("Rover Dashboard")
-# Center metric labels using custom CSS
+
 st.markdown("""
     <style>
     div[data-testid="stMetric"] > label, div[data-testid="stMetric"] > div > label {
@@ -731,9 +733,9 @@ while True:
                     "PathLayer",
                     data=[{"path": history}],
                     get_path="path",
-                    get_color=[0, 0, 255, 150], # Blue trail
-                    width_min_pixels=2,
-                    get_width=0.2, # meters
+                    get_color=[255, 255, 0, 255], # Bright yellow trail (fully opaque)
+                    width_min_pixels=1,
+                    get_width=0.05, # meters (match mission path)
                     width_units='"meters"'
                 ))
 
