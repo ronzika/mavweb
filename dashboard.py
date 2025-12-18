@@ -554,12 +554,16 @@ with col_btn5:
                     int(next_wp)
                 )
                 st.toast(f"Skipped to WP {next_wp}")
+                # Add message to STATUSTEXT window
+                get_shared_state().append_message(f"[UI] Skipped to WP {next_wp}")
             else:
                 st.warning("MAVLink connection not available.")
+                get_shared_state().append_message("[UI] Failed to skip waypoint: MAVLink connection not available.")
         except Exception as e:
             st.error(f"Failed to skip waypoint: {e}")
+            get_shared_state().append_message(f"[UI] Failed to skip waypoint: {e}")
 with col_btn6:
-    if st.button("Arm"):
+    if st.button("Arm", disabled=False):
         try:
             if client:
                 client.mav.command_long_send(
@@ -575,7 +579,7 @@ with col_btn6:
         except Exception as e:
             st.error(f"Failed to send ARM command: {e}")
 with col_btn7:
-    if st.button("Disarm"):
+    if st.button("Disarm", disabled=False):
         try:
             if client:
                 client.mav.command_long_send(
@@ -603,12 +607,15 @@ with col_btn8:
                     # Request mission list
                     client.mav.mission_request_list_send(client.target_system, client.target_component)
                     st.toast("Requesting mission...")
+                    get_shared_state().append_message("[UI] Requested mission list from vehicle.")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
                     get_shared_state().set_loading(False)
+                    get_shared_state().append_message(f"[UI] Failed to request mission: {e}")
             else:
                 st.warning("Mission loading only supported in MAVLink mode for now.")
+                get_shared_state().append_message("[UI] Failed to request mission: MAVLink connection not available.")
 
 # Reboot button (far right), only enabled when not armed
 with col_btn9:
@@ -655,7 +662,7 @@ while True:
         gps1_fix = data.get('gps1_fix', 'No Fix')
         gps2_fix = data.get('gps2_fix')
         if gps2_fix:
-            metric_gps.metric("GPS Fix", f"1: {gps1_fix} / 2: {gps2_fix}")
+            metric_gps.metric("GPS Fix", f"1: {gps1_fix}\n2: {gps2_fix}")
         else:
             metric_gps.metric("GPS Fix", gps1_fix)
         heading = data.get('heading_deg')
