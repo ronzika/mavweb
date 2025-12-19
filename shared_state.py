@@ -1,0 +1,87 @@
+import threading
+import time
+import streamlit as st
+import queue
+
+class SharedState:
+    def __init__(self):
+        self.rover_data = {
+            'link_active': False,
+            'mode': 'DISCONNECTED',
+            'armed': False,
+            'lat': None,
+            'lon': None,
+            'heading_deg': 0,
+            'speed_ms': 0,
+            'gps1_fix': 'No Fix',
+            'satellites_visible': 0,
+            'gps2_fix': None,
+            'gps2_satellites_visible': 0,
+            'gps2_lat': None,
+            'gps2_lon': None,
+            'battery_v': 0,
+            'battery_pct': 0,
+            'messages': [],
+            'mission_points': [],
+            'wp_current': 0,
+            'last_update': 0,
+            'link_quality': 100,
+            'packets_received': 0,
+            'packets_lost': 0
+        }
+        self.lock = threading.Lock()
+        self.mav_lock = threading.Lock()
+        self.connection = None
+        self.upload_queue = queue.Queue()
+        self.upload_status = {'status': 'idle', 'message': ''}
+
+    def set_upload_status(self, status, message):
+        with self.lock:
+            self.upload_status = {'status': status, 'message': message}
+
+    def get_upload_status(self):
+        with self.lock:
+            return self.upload_status
+
+    def acquire_mav_lock(self):
+        return self.mav_lock
+
+    def set_connection(self, conn):
+        with self.lock:
+            self.connection = conn
+
+    def get_connection(self):
+        with self.lock:
+            return self.connection
+
+    def update(self, data):
+        with self.lock:
+            self.rover_data.update(data)
+            self.rover_data['last_update'] = time.time()
+
+    def append_message(self, msg_text):
+        print(f"[Rover Message] {msg_text}")
+        with self.lock:
+            msg_text = str(msg_text).strip()
+
+            if not msg_text:
+                return
+
+            msgs = self.rover_data.get('messages', [])
+            
+            # Simple Deduplication: Only check the very last message
+            # This allows sequential updates (A -> B -> A) but stops immediate bursts (A -> A -> A)
+            if msgs and msgs[0] == msg_text:
+                return
+            
+            msgs.insert(0, msg_text)
+            self.rover_data['messages'] = msgs[:15] # Keep last 15
+            self.rover_data['last_update'] = time.time()
+
+    def get(self):
+        with self.lock:
+            return self.rover_data.copy()
+
+@st.cache_resource
+def get_shared_state():
+    return SharedState()

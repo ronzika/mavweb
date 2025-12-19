@@ -1,7 +1,3 @@
-"""
-Streamlit Missions Page
-"""
-
 import streamlit as st
 import os
 import pandas as pd
@@ -9,19 +5,19 @@ import pydeck as pdk
 from missions import list_missions, parse_waypoints_file
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 import mavlink_utils
+from shared_state import get_shared_state
 
 
 #def render():
-st.title('Missions')
+st.title('Mission Management')
 missions_dir = os.path.join(os.path.dirname(__file__), 'missions')
-st.subheader('Upload Missions')
+
 uploaded_files = st.file_uploader(
-	'Upload .waypoints files',
+	'Mission File Upload',
 	type=['waypoints'],
 	accept_multiple_files=True,
 	key='missions_upload_dialog'
 )
-print(uploaded_files)
 
 if uploaded_files:
 	for uploaded_file in uploaded_files:
@@ -68,7 +64,71 @@ if len(missions) > 0:
 		# Update session state for persistence (optional)
 		st.session_state['selected_mission'] = selected_mission
 	else:
-		selected_mission = st.session_state.get('selected_mission', None)
+		selected_mission = None
+		st.session_state['selected_mission'] = None
+
+	mission_selected = st.session_state.get('selected_mission') is not None
+
+	if mission_selected:
+		mission_name = os.path.splitext(st.session_state['selected_mission'])[0]
+		st.sidebar.markdown(f"**Selected:** {mission_name}")
+
+	if st.sidebar.button("Load to FC", use_container_width=True, disabled=not mission_selected):
+		filename = st.session_state['selected_mission']
+		mission_row = df[df['Filename'] == filename]
+		if not mission_row.empty:
+			path = mission_row.iloc[0]['Path']
+			print(f"Uploading mission from {path}")
+			
+			mission_items = mavlink_utils.parse_mission_file(path)
+			if mission_items:
+				state = get_shared_state()
+				# Reset status before starting
+				state.set_upload_status('pending', 'Queued for upload...')
+				state.upload_queue.put(mission_items)
+				
+				with st.spinner("Uploading..."):
+					import time
+					start_time = time.time()
+					while time.time() - start_time < 30: # 30s timeout
+						status = state.get_upload_status()
+						if status['status'] == 'success':
+							st.sidebar.success(status['message'])
+							break
+						elif status['status'] == 'error':
+							st.sidebar.error(status['message'])
+							break
+						time.sleep(0.5)
+					else:
+						st.sidebar.error("Upload timed out.")
+			else:
+				st.sidebar.error("Failed to parse mission file.")
+
+	st.sidebar.button("Download", use_container_width=True, disabled=not mission_selected)
+
+	if st.sidebar.button("Delete", use_container_width=True, disabled=not mission_selected):
+		if st.session_state.get('selected_mission'):
+			st.session_state['delete_confirm'] = True
+		else:
+			st.sidebar.warning("No mission selected")
+
+	if st.session_state.get('delete_confirm'):
+		st.sidebar.warning(f"Delete {st.session_state['selected_mission']}?")
+		col_yes, col_no = st.sidebar.columns(2)
+		if col_yes.button("Yes", key="del_yes"):
+			try:
+				os.remove(os.path.join(missions_dir, st.session_state['selected_mission']))
+				st.sidebar.success(f"Deleted {st.session_state['selected_mission']}")
+				st.session_state['selected_mission'] = None
+				st.session_state['delete_confirm'] = False
+				st.rerun()
+			except Exception as e:
+				st.sidebar.error(f"Error: {e}")
+		if col_no.button("No", key="del_no"):
+			st.session_state['delete_confirm'] = False
+			st.rerun()
+
+	st.sidebar.divider()
 
 	# Show preview if a mission is selected and exists in DataFrame
 	if selected_mission is not None and selected_mission != '':

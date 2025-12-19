@@ -1,18 +1,22 @@
-# Upload a mission file to the flight controller (placeholder)
-def upload_mission_to_fc(filepath: str) -> bool:
-    import os
-    import time
-    import traceback
-    from dotenv import load_dotenv
-    load_dotenv()
-    endpoint = os.getenv("MAVLINK_ENDPOINT", "udpin:0.0.0.0:14550")
+import os
+import time
+import traceback
+import threading
+import socket
+import base64
+from typing import Any
+from pymavlink import mavutil
+from dotenv import load_dotenv
+
+load_dotenv()
+
+def parse_mission_file(filepath: str):
     try:
-        # Parse QGC WPL 110 format
         with open(filepath) as f:
             lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
         if not lines or not lines[0].startswith('QGC WPL'):
             print("[MAVLINK] Not a QGC WPL mission file.")
-            return False
+            return None
         mission_items = []
         for line in lines[1:]:
             cols = line.split('\t')
@@ -32,23 +36,27 @@ def upload_mission_to_fc(filepath: str) -> bool:
                 'z': float(cols[10]),
                 'autocontinue': int(cols[11])
             })
-        if not mission_items:
-            print("[MAVLINK] No mission items to upload.")
-            return False
-        print(f"[MAVLINK] Connecting to {endpoint}")
-        master = mavutil.mavlink_connection(endpoint)
-        master.wait_heartbeat(timeout=10)
-        print("[MAVLINK] Heartbeat received. Clearing existing mission...")
+        return mission_items
+    except Exception as e:
+        print(f"[MAVLINK] Error parsing mission file: {e}")
+        return None
+
+def upload_mission(master, mission_items):
+    try:
+        print("[MAVLINK] Clearing existing mission...")
         master.mav.mission_clear_all_send(master.target_system, master.target_component)
         ack = master.recv_match(type='MISSION_ACK', blocking=True, timeout=5)
         print(f"[MAVLINK] Clear ACK: {ack}")
+        
         print(f"[MAVLINK] Sending {len(mission_items)} mission items...")
         master.mav.mission_count_send(master.target_system, master.target_component, len(mission_items))
+        
         for i, item in enumerate(mission_items):
             req = master.recv_match(type='MISSION_REQUEST', blocking=True, timeout=5)
             if req is None or req.seq != i:
                 print(f"[MAVLINK] No request for seq {i}, got: {req}")
                 return False
+            
             master.mav.mission_item_send(
                 master.target_system,
                 master.target_component,
@@ -65,23 +73,33 @@ def upload_mission_to_fc(filepath: str) -> bool:
                 item['y'],
                 item['z']
             )
-            print(f"[MAVLINK] Sent mission item {i}: {item}")
+            print(f"[MAVLINK] Sent mission item {i}")
+            
         ack = master.recv_match(type='MISSION_ACK', blocking=True, timeout=10)
         print(f"[MAVLINK] Mission upload ACK: {ack}")
         return ack is not None and ack.type == 0
     except Exception as e:
         print(f"[MAVLINK] Mission upload failed: {e}\n{traceback.format_exc()}")
         return False
+
+def upload_mission_to_fc(filepath: str) -> bool:
+    endpoint = os.getenv("MAVLINK_ENDPOINT", "udpin:0.0.0.0:14550")
+    mission_items = parse_mission_file(filepath)
+    if not mission_items:
+        return False
+        
+    try:
+        print(f"[MAVLINK] Connecting to {endpoint}")
+        master = mavutil.mavlink_connection(endpoint)
+        master.wait_heartbeat(timeout=10)
+        return upload_mission(master, mission_items)
+    except Exception as e:
+        print(f"[MAVLINK] Connection failed: {e}")
+        return False
+
 """
 MAVLink and NTRIP logic
 """
-import os
-import threading
-import time
-import socket
-import base64
-from pymavlink import mavutil
-from typing import Any
 
 NTRIP_CONNECTED = {'status': False, 'rtcm_count': 0}
 

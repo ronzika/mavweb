@@ -15,7 +15,8 @@ import pydeck as pdk
 import streamlit as st
 from dotenv import load_dotenv
 from pymavlink import mavutil
-# from streamlit_autorefresh import st_autorefresh
+from shared_state import get_shared_state
+from mavlink_utils import upload_mission
 
 # --- Configuration ---
 load_dotenv()
@@ -23,77 +24,46 @@ MAVLINK_ENDPOINT = os.getenv("MAVLINK_ENDPOINT", "udpin:0.0.0.0:14550")
 
 st.set_page_config(page_title="Rover GCS", layout="wide", initial_sidebar_state="expanded")
 
-# --- Thread-Safe State Class ---
-class SharedState:
-    def __init__(self):
-        self.rover_data = {
-            'link_active': False,
-            'mode': 'DISCONNECTED',
-            'armed': False,
-            'lat': None,
-            'lon': None,
-            'heading_deg': 0,
-            'speed_ms': 0,
-            'gps1_fix': 'No Fix',
-            'satellites_visible': 0,
-            'gps2_fix': None,
-            'gps2_satellites_visible': 0,
-            'gps2_lat': None,
-            'gps2_lon': None,
-            'battery_v': 0,
-            'battery_pct': 0,
-            'messages': [],
-            'mission_points': [],
-            'wp_current': 0,
-            'last_update': 0
-        }
-        self.lock = threading.Lock()
-        self.mav_lock = threading.Lock()
-        self.connection = None
+# --- Settings Page ---
+def load_env_example():
+    env_path = Path(__file__).parent / '.env'
+    env_vars = {}
+    if env_path.exists():
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                match = re.match(r'([A-Za-z0-9_]+)=(.*)', line)
+                if match:
+                    key, value = match.groups()
+                    env_vars[key] = value
+    return env_vars
 
-    def acquire_mav_lock(self):
-        return self.mav_lock
+def save_env_vars(new_vars):
+    env_path = Path(__file__).parent / '.env'
+    with open(env_path, 'w') as f:
+        for k, v in new_vars.items():
+            f.write(f'{k}={v}\n')
 
-    def set_connection(self, conn):
-        with self.lock:
-            self.connection = conn
+def settings_page():
+    st.title('Settings')
+    st.info('Edit and save environment variables. Changes will be written to .env.')
+    env_vars = load_env_example()
+    current = {k: st.session_state.get(f'env_{k}', v) for k, v in env_vars.items()}
+    with st.form('env_form'):
+        new_vars = {}
+        for k, v in env_vars.items():
+            new_vars[k] = st.text_input(k, value=current[k], key=f'env_{k}')
+        submitted = st.form_submit_button('Save')
+        if submitted:
+            save_env_vars(new_vars)
+            st.session_state['Pages'] = 'Dashboard'
+            st.success('.env updated! Reloading app...')
+            st.rerun()
 
-    def get_connection(self):
-        with self.lock:
-            return self.connection
 
-    def update(self, data):
-        with self.lock:
-            self.rover_data.update(data)
-            self.rover_data['last_update'] = time.time()
 
-    def append_message(self, msg_text):
-        print(f"[Rover Message] {msg_text}")
-        with self.lock:
-            msg_text = str(msg_text).strip()
-
-            if not msg_text:
-                return
-
-            msgs = self.rover_data.get('messages', [])
-            
-            # Simple Deduplication: Only check the very last message
-            # This allows sequential updates (A -> B -> A) but stops immediate bursts (A -> A -> A)
-            if msgs and msgs[0] == msg_text:
-                return
-            
-            msgs.insert(0, msg_text)
-            self.rover_data['messages'] = msgs[:15] # Keep last 15
-            self.rover_data['last_update'] = time.time()
-#            self.rover_data['last_update'] = time.time()
-
-    def get(self):
-        with self.lock:
-            return self.rover_data.copy()
-
-@st.cache_resource
-def get_shared_state():
-    return SharedState()
 
 # --- MAVLink Utilities ---
 def get_mode_name(custom_mode):
@@ -124,9 +94,17 @@ def mavlink_worker(endpoint, state):
     _mission_cache = {}
     _mission_total = 0
     
+    # Link Quality Tracking
+    last_seq = None
+    packet_history = []
+    WINDOW_SIZE = 100
+
     while True:
         conn = None
         state.set_connection(None)
+        last_seq = None
+        packet_history = []
+        
         try:
             state.append_message(f"Attempting MAVLink: {endpoint}")
             conn = mavutil.mavlink_connection(endpoint)
@@ -164,6 +142,20 @@ def mavlink_worker(endpoint, state):
 
             last_heartbeat = 0
             while True:
+                # Check for pending mission upload
+                if not state.upload_queue.empty():
+                    try:
+                        mission_items = state.upload_queue.get_nowait()
+                        state.set_upload_status('uploading', 'Starting upload...')
+                        # Use the existing connection to upload
+                        success = upload_mission(conn, mission_items)
+                        if success:
+                            state.set_upload_status('success', 'Upload complete!')
+                        else:
+                            state.set_upload_status('error', 'Upload failed.')
+                    except Exception as e:
+                        state.set_upload_status('error', f'Upload error: {e}')
+
                 # Send Heartbeat to GCS every 1s
                 if time.time() - last_heartbeat > 1.0:
                     conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS, mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
@@ -177,7 +169,33 @@ def mavlink_worker(endpoint, state):
                     continue
 
                 mtype = msg.get_type()
+                if mtype == 'BAD_DATA':
+                    continue
+
                 data = {'link_active': True}
+
+                # Link Quality Calculation
+                try:
+                    seq = msg.get_seq()
+                    if last_seq is not None:
+                        diff = (seq - last_seq) % 256
+                        lost = diff - 1
+                        if lost < 0: lost = 0
+                        
+                        if lost > 0:
+                            packet_history.extend([0] * lost)
+                        packet_history.append(1)
+                        
+                        if len(packet_history) > WINDOW_SIZE:
+                            packet_history = packet_history[-WINDOW_SIZE:]
+                        
+                        lq = (sum(packet_history) / len(packet_history)) * 100
+                        data['link_quality'] = int(lq)
+                    else:
+                        packet_history.append(1)
+                    last_seq = seq
+                except Exception:
+                    pass
 
                 if mtype == 'HEARTBEAT':
                     data['mode'] = get_mode_name(msg.custom_mode)
@@ -429,7 +447,7 @@ if st.sidebar.button("HOLD", use_container_width=True, disabled=is_disabled):
         except Exception as e:
             st.error(f"Failed to set mode: {e}")
 
-if st.sidebar.button("ARM", type="primary", use_container_width=True, disabled=is_disabled):
+if st.sidebar.button("ARM", use_container_width=True, disabled=is_disabled):
     if cmd_conn:
         try:
             with get_shared_state().acquire_mav_lock():
@@ -439,7 +457,7 @@ if st.sidebar.button("ARM", type="primary", use_container_width=True, disabled=i
         except Exception as e:
             st.error(f"Failed to arm: {e}")
 
-if st.sidebar.button("DISARM", use_container_width=True, disabled=is_disabled):
+if st.sidebar.button("Disarm", use_container_width=True, disabled=is_disabled):
     if cmd_conn:
         try:
             with get_shared_state().acquire_mav_lock():
@@ -542,8 +560,13 @@ while True:
         sidebar_status_ph.error("OFFLINE: Searching...")
 
     # Sidebar GPS
+    lq = current_data.get('link_quality', 100)
+    lq_color = "#4caf50" if lq >= 90 else "#ff9800" if lq >= 70 else "#f44336"
+
     gps_html = f"""
     <div style="line-height: 1.2; font-size: 0.9rem;">
+        <b>Link Quality:</b> <span style="color:{lq_color}; font-weight:bold;">{lq}%</span><br>
+        <hr style="margin: 5px 0; border-color: #333;">
         <b>GPS 1:</b> {current_data.get('gps1_fix')}<br>
         Lat: {current_data.get('lat') or 'N/A'}<br>
         Lon: {current_data.get('lon') or 'N/A'}<br>
