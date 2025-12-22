@@ -98,12 +98,22 @@ def mavlink_worker(endpoint, state):
     last_seq = None
     packet_history = []
     WINDOW_SIZE = 100
+    raw_lq_history = [] # For smoothing
+    last_sparkline_update = 0
+    
+    # Mission Download State
+    mission_download_active = False
+    mission_next_seq = 0
+    mission_last_req_time = 0
 
     while True:
         conn = None
         state.set_connection(None)
         last_seq = None
         packet_history = []
+        raw_lq_history = []
+        last_sparkline_update = 0
+        mission_download_active = False
         
         try:
             state.append_message(f"Attempting MAVLink: {endpoint}")
@@ -160,6 +170,16 @@ def mavlink_worker(endpoint, state):
                 if time.time() - last_heartbeat > 1.0:
                     conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS, mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
                     last_heartbeat = time.time()
+                
+                # Mission Download Retry Logic
+                if mission_download_active and time.time() - mission_last_req_time > 1.0:
+                    if mission_next_seq < _mission_total:
+                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Retry requesting mission item {mission_next_seq}")
+                        with state.acquire_mav_lock():
+                            conn.mav.mission_request_int_send(conn.target_system, conn.target_component, mission_next_seq)
+                        mission_last_req_time = time.time()
+                    else:
+                        mission_download_active = False
 
                 msg = conn.recv_match(blocking=True, timeout=0.5)
                 if not msg:
@@ -191,6 +211,21 @@ def mavlink_worker(endpoint, state):
                         
                         lq = (sum(packet_history) / len(packet_history)) * 100
                         data['link_quality'] = int(lq)
+                        
+                        # Update history for sparkline (Smoothed)
+                        raw_lq_history.append(lq)
+                        if len(raw_lq_history) > 20:
+                            raw_lq_history.pop(0)
+                        
+                        if time.time() - last_sparkline_update > 1.0:
+                            smoothed_lq = sum(raw_lq_history) / len(raw_lq_history)
+                            current_hist = state.get().get('link_quality_history', [])
+                            current_hist.append(int(smoothed_lq))
+                            if len(current_hist) > 50:
+                                current_hist = current_hist[-50:]
+                            data['link_quality_history'] = current_hist
+                            last_sparkline_update = time.time()
+                        
                     else:
                         packet_history.append(1)
                     last_seq = seq
@@ -234,7 +269,7 @@ def mavlink_worker(endpoint, state):
                 elif mtype == 'STATUSTEXT':
                     txt = str(msg.text)
                     state.append_message(txt)
-                    print(f"[STATUSTEXT] setting {txt}")
+                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [STATUSTEXT] setting {txt}")
                     # Parse "Mission: #" messages (ArduPilot)
                     # Also handle "Reached command #"
                     wp_num = -1
@@ -261,16 +296,25 @@ def mavlink_worker(endpoint, state):
                     _mission_cache = {}
                     _mission_total = msg.count
                     if _mission_total > 0:
+                        mission_download_active = True
+                        mission_next_seq = 0
                         with state.acquire_mav_lock():
                             conn.mav.mission_request_int_send(conn.target_system, conn.target_component, 0)
+                        mission_last_req_time = time.time()
 
                 elif mtype == 'MISSION_ITEM_INT':
                     # Store as [lon, lat] for PyDeck
                     _mission_cache[msg.seq] = [msg.y / 1e7, msg.x / 1e7]
-                    if msg.seq < _mission_total - 1:
+                    
+                    if msg.seq == mission_next_seq:
+                        mission_next_seq += 1
+                        
+                    if mission_next_seq < _mission_total:
                         with state.acquire_mav_lock():
-                            conn.mav.mission_request_int_send(conn.target_system, conn.target_component, msg.seq + 1)
-                    else:
+                            conn.mav.mission_request_int_send(conn.target_system, conn.target_component, mission_next_seq)
+                        mission_last_req_time = time.time()
+                    elif mission_download_active:
+                        mission_download_active = False
                         sorted_pts = [v for k, v in sorted(_mission_cache.items())]
                         state.update({'mission_points': sorted_pts})
                         state.append_message(f"Mission loaded: {len(sorted_pts)} points")
@@ -306,6 +350,29 @@ def get_offset_point(lat, lon, dist, bearing_deg):
     d_lat = (dy / r_earth) * (180 / math.pi)
     d_lon = (dx / r_earth) * (180 / math.pi) / math.cos(math.radians(lat))
     return [lon + d_lon, lat + d_lat]
+
+def generate_sparkline(data, width=280, height=40, color="#4caf50"):
+    if not data or len(data) < 2:
+        return ""
+    min_val = 0
+    max_val = 100
+    points = []
+    
+    # Fixed max points to ensure scrolling effect (matches history buffer size)
+    max_points = 50
+    step = width / (max_points - 1)
+
+    for i, val in enumerate(data):
+        x = i * step
+        y = height - ((val - min_val) / (max_val - min_val)) * height
+        points.append(f"{x},{y}")
+    
+    polyline = " ".join(points)
+    return f"""
+    <svg width="100%" height="{height}" viewBox="0 0 {width} {height}" preserveAspectRatio="none" style="background-color: rgba(255,255,255,0.05); border-radius: 3px; margin-bottom: 5px;">
+        <polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="2" />
+    </svg>
+    """
 
 # --- UI Functions ---
 def create_map_deck(data):
@@ -410,6 +477,7 @@ start_background_threads()
 st.sidebar.title("🎮 Rover Control")
 sidebar_status_ph = st.sidebar.empty()
 st.sidebar.divider()
+sidebar_sparkline_ph = st.sidebar.empty()
 sidebar_gps_ph = st.sidebar.empty()
 st.sidebar.divider()
 st.sidebar.subheader("Commands")
@@ -529,7 +597,7 @@ console_placeholder = st.empty()
 if 'history' not in st.session_state:
     st.session_state.history = []
 
-print("[App] Starting main update loop...")
+print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] Starting main update loop...")
 # --- Update Loop ---
 while True:
     current_data = get_shared_state().get()
@@ -562,27 +630,32 @@ while True:
     # Sidebar GPS
     lq = current_data.get('link_quality', 100)
     lq_color = "#4caf50" if lq >= 90 else "#ff9800" if lq >= 70 else "#f44336"
+    
+    # Render Sparkline
+    lq_hist = current_data.get('link_quality_history', [])
+    sparkline_svg = generate_sparkline(lq_hist, color=lq_color)
+    sidebar_sparkline_ph.markdown(sparkline_svg, unsafe_allow_html=True)
 
     gps_html = f"""
-    <div style="line-height: 1.2; font-size: 0.9rem;">
-        <b>Link Quality:</b> <span style="color:{lq_color}; font-weight:bold;">{lq}%</span><br>
-        <hr style="margin: 5px 0; border-color: #333;">
-        <b>GPS 1:</b> {current_data.get('gps1_fix')}<br>
-        Lat: {current_data.get('lat') or 'N/A'}<br>
-        Lon: {current_data.get('lon') or 'N/A'}<br>
-        Sats: {current_data.get('satellites_visible')}
-    </div>
-    """
+<div style="line-height: 1.2; font-size: 0.9rem;">
+    <b>Link Quality:</b> <span style="color:{lq_color}; font-weight:bold;">{lq}%</span><br>
+    <hr style="margin: 5px 0; border-color: #333;">
+    <b>GPS 1:</b> {current_data.get('gps1_fix')}<br>
+    Lat: {current_data.get('lat') or 'N/A'}<br>
+    Lon: {current_data.get('lon') or 'N/A'}<br>
+    Sats: {current_data.get('satellites_visible')}
+</div>
+"""
     if current_data.get('gps2_fix'):
         gps_html += f"""
-        <hr>
-        <div style="line-height: 1.2; font-size: 0.9rem;">
-            <b>GPS 2:</b> {current_data.get('gps2_fix')}<br>
-            Lat: {current_data.get('gps2_lat') or 'N/A'}<br>
-            Lon: {current_data.get('gps2_lon') or 'N/A'}<br>
-            Sats: {current_data.get('gps2_satellites_visible')}
-        </div>
-        """
+<hr>
+<div style="line-height: 1.2; font-size: 0.9rem;">
+    <b>GPS 2:</b> {current_data.get('gps2_fix')}<br>
+    Lat: {current_data.get('gps2_lat') or 'N/A'}<br>
+    Lon: {current_data.get('gps2_lon') or 'N/A'}<br>
+    Sats: {current_data.get('gps2_satellites_visible')}
+</div>
+"""
     sidebar_gps_ph.markdown(gps_html, unsafe_allow_html=True)
 
     # Metrics

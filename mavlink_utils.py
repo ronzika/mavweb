@@ -1,5 +1,6 @@
 import os
 import time
+import datetime
 import traceback
 import threading
 import socket
@@ -45,19 +46,45 @@ def upload_mission(master, mission_items):
     try:
         print("[MAVLINK] Clearing existing mission...")
         master.mav.mission_clear_all_send(master.target_system, master.target_component)
-        ack = master.recv_match(type='MISSION_ACK', blocking=True, timeout=5)
-        print(f"[MAVLINK] Clear ACK: {ack}")
+        
+        # Wait for ACK for clear
+        ack = master.recv_match(type='MISSION_ACK', blocking=True, timeout=3)
+        if ack:
+            print(f"[MAVLINK] Clear ACK: {ack.type}")
         
         print(f"[MAVLINK] Sending {len(mission_items)} mission items...")
         master.mav.mission_count_send(master.target_system, master.target_component, len(mission_items))
         
-        for i, item in enumerate(mission_items):
-            req = master.recv_match(type='MISSION_REQUEST', blocking=True, timeout=5)
-            if req is None or req.seq != i:
-                print(f"[MAVLINK] No request for seq {i}, got: {req}")
-                return False
+        last_req_seq = -1
+        
+        while True:
+            # Wait for REQUEST or ACK
+            # We use a shorter timeout to allow for potential retries or UI updates if needed, 
+            # but here we just block.
+            msg = master.recv_match(type=['MISSION_REQUEST', 'MISSION_REQUEST_INT', 'MISSION_ACK'], blocking=True, timeout=5)
             
-            master.mav.mission_item_send(
+            if msg is None:
+                print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Timeout waiting for mission request/ack")
+                return False
+                
+            if msg.get_type() == 'MISSION_ACK':
+                if msg.type == 0: # MAV_MISSION_ACCEPTED
+                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Mission upload success!")
+                    return True
+                else:
+                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Mission upload failed with ACK error: {msg.type}")
+                    return False
+            
+            # Handle Request
+            seq = msg.seq
+            if seq >= len(mission_items):
+                print(f"[MAVLINK] Requested seq {seq} out of bounds")
+                continue
+                
+            item = mission_items[seq]
+            
+            # Use INT for precision and robustness
+            master.mav.mission_item_int_send(
                 master.target_system,
                 master.target_component,
                 item['seq'],
@@ -69,17 +96,17 @@ def upload_mission(master, mission_items):
                 item['param2'],
                 item['param3'],
                 item['param4'],
-                item['x'],
-                item['y'],
-                item['z']
+                int(item['x'] * 1e7), # Lat
+                int(item['y'] * 1e7), # Lon
+                float(item['z'])      # Alt
             )
-            print(f"[MAVLINK] Sent mission item {i}")
             
-        ack = master.recv_match(type='MISSION_ACK', blocking=True, timeout=10)
-        print(f"[MAVLINK] Mission upload ACK: {ack}")
-        return ack is not None and ack.type == 0
+            if seq != last_req_seq:
+                print(f"[MAVLINK] Sent mission item {seq}")
+                last_req_seq = seq
+
     except Exception as e:
-        print(f"[MAVLINK] Mission upload failed: {e}\n{traceback.format_exc()}")
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Mission upload failed: {e}\n{traceback.format_exc()}")
         return False
 
 def upload_mission_to_fc(filepath: str) -> bool:
@@ -89,7 +116,7 @@ def upload_mission_to_fc(filepath: str) -> bool:
         return False
         
     try:
-        print(f"[MAVLINK] Connecting to {endpoint}")
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Connecting to {endpoint}")
         master = mavutil.mavlink_connection(endpoint)
         master.wait_heartbeat(timeout=10)
         return upload_mission(master, mission_items)

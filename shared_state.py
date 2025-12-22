@@ -26,6 +26,7 @@ class SharedState:
             'wp_current': 0,
             'last_update': 0,
             'link_quality': 100,
+            'link_quality_history': [],
             'packets_received': 0,
             'packets_lost': 0
         }
