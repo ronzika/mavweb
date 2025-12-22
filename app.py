@@ -19,8 +19,18 @@ from shared_state import get_shared_state
 from mavlink_utils import upload_mission
 
 # --- Configuration ---
-load_dotenv()
+env_path = Path(__file__).parent / '.env'
+print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Loading .env from: {env_path} (Exists: {env_path.exists()})")
+load_dotenv(dotenv_path=env_path, override=True)
+
 MAVLINK_ENDPOINT = os.getenv("MAVLINK_ENDPOINT", "udpin:0.0.0.0:14550")
+MAPBOX_API_KEY = os.getenv("MAPBOX_API_KEY")
+
+# Debug Mapbox Key
+if MAPBOX_API_KEY:
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Mapbox Key Loaded: {MAPBOX_API_KEY[:10]}...")
+else:
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] WARNING: Mapbox Key NOT Found!")
 
 st.set_page_config(page_title="Rover GCS", layout="wide", initial_sidebar_state="expanded")
 
@@ -397,7 +407,8 @@ def mavlink_worker(endpoint, state):
                     
                     # Reduce logging verbosity
                     if msg.seq % 10 == 0 or msg.seq == _mission_total - 1:
-                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Recv Item {msg.seq}/{_mission_total}: {lat}, {lon}")
+                        pass
+                        # print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Recv Item {msg.seq}/{_mission_total}: {lat}, {lon}")
                     
                     # Store as [lon, lat] for PyDeck
                     _mission_cache[msg.seq] = [lon, lat]
@@ -471,7 +482,7 @@ def generate_sparkline(data, width=280, height=40, color="#4caf50"):
     """
 
 # --- UI Functions ---
-def create_map_deck(data):
+def create_map_deck(data, map_style='mapbox://styles/mapbox/satellite-v9'):
     lat, lon = data.get('lat'), data.get('lon')
     if not lat or lat == 0:
         return None
@@ -569,7 +580,14 @@ def create_map_deck(data):
         line_width_min_pixels=1,
     ))
 
-    return pdk.Deck(initial_view_state=view_state, layers=layers, tooltip=True)
+    return pdk.Deck(
+        initial_view_state=view_state, 
+        layers=layers, 
+        tooltip=True, 
+        map_style=map_style,
+        map_provider="mapbox",
+        api_keys={"mapbox": MAPBOX_API_KEY} if MAPBOX_API_KEY else None
+    )
 
 # --- MAIN APP ---
 start_background_threads()
@@ -646,6 +664,20 @@ if st.sidebar.button("Load Map", use_container_width=True, disabled=is_disabled)
             st.rerun()
         except Exception as e:
             st.error(f"Failed to load map: {e}")
+
+st.sidebar.divider()
+st.sidebar.subheader("Map Settings")
+# Default to "Dark" (Index 3) to match previous behavior
+map_style_name = st.sidebar.selectbox("Map Style", ["Satellite", "Satellite Streets", "Streets", "Dark", "Light", "Outdoors"], index=3, disabled=False, key="map_style_select_fixed")
+map_styles = {
+    "Satellite": "mapbox://styles/mapbox/satellite-v9",
+    "Satellite Streets": "mapbox://styles/mapbox/satellite-streets-v12",
+    "Streets": "mapbox://styles/mapbox/streets-v11",
+    "Dark": "mapbox://styles/mapbox/dark-v10",
+    "Light": "mapbox://styles/mapbox/light-v10",
+    "Outdoors": "mapbox://styles/mapbox/outdoors-v11"
+}
+selected_map_style = map_styles[map_style_name]
 
 if is_disabled:
     st.sidebar.warning("Commands disabled: MAVLink connection not available.")
@@ -770,9 +802,12 @@ while True:
     metric_wp.metric("WP", f"{current_data.get('wp_current', 0)}")
 
     # Map
-    deck = create_map_deck(current_data)
+    deck = create_map_deck(current_data, selected_map_style)
     if deck:
-        map_placeholder.pydeck_chart(deck, key=str(uuid.uuid4()))
+        # Use a stable key that only changes when the style changes
+        # This prevents the map from reloading tiles every second
+        map_key = f"map_{map_style_name}"
+        map_placeholder.pydeck_chart(deck, key=map_key, width="stretch")
     else:
         map_placeholder.info("🛰️ Waiting for GPS Position...")
 
