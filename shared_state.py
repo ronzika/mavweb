@@ -35,6 +35,7 @@ class SharedState:
         self.connection = None
         self.upload_queue = queue.Queue()
         self.upload_status = {'status': 'idle', 'message': ''}
+        self.current_worker_id = None
 
     def set_upload_status(self, status, message):
         with self.lock:

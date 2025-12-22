@@ -91,6 +91,11 @@ def mavlink_worker(endpoint, state):
     """
     Runs in background. Uses 'state' object directly to avoid Streamlit Context errors.
     """
+    # Worker Identity for Cleanup
+    worker_id = str(uuid.uuid4())
+    state.current_worker_id = worker_id
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Starting MAVLink Worker {worker_id}")
+
     _mission_cache = {}
     _mission_total = 0
     
@@ -107,6 +112,11 @@ def mavlink_worker(endpoint, state):
     mission_last_req_time = 0
 
     while True:
+        # Check if a new worker has taken over
+        if state.current_worker_id != worker_id:
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Stopping MAVLink Worker {worker_id} (Superseded)")
+            return
+
         conn = None
         state.set_connection(None)
         last_seq = None
@@ -120,14 +130,36 @@ def mavlink_worker(endpoint, state):
             conn = mavutil.mavlink_connection(endpoint)
             
             # Wait for Autopilot Heartbeat (Ignore GCS)
-            while True:
-                msg = conn.recv_match(type='HEARTBEAT', blocking=True, timeout=10)
+            # Prefer Component 1 (Autopilot)
+            found_sys = None
+            found_comp = None
+            start_wait = time.time()
+            
+            state.append_message("Scanning for vehicle...")
+            while time.time() - start_wait < 10:
+                msg = conn.recv_match(type='HEARTBEAT', blocking=True, timeout=0.5)
                 if not msg:
-                    raise Exception("No Heartbeat found")
-                if msg.type != mavutil.mavlink.MAV_TYPE_GCS:
-                    conn.target_system = msg.get_srcSystem()
-                    conn.target_component = msg.get_srcComponent()
+                    continue
+                
+                if msg.type == mavutil.mavlink.MAV_TYPE_GCS:
+                    continue
+                
+                # If we found an autopilot, lock on and break
+                if msg.get_srcComponent() == 1:
+                    found_sys = msg.get_srcSystem()
+                    found_comp = msg.get_srcComponent()
                     break
+                
+                # Otherwise, keep the first candidate
+                if found_sys is None:
+                    found_sys = msg.get_srcSystem()
+                    found_comp = msg.get_srcComponent()
+            
+            if found_sys is None:
+                 raise Exception("No Vehicle Heartbeat found")
+            
+            conn.target_system = found_sys
+            conn.target_component = found_comp
             
             state.set_connection(conn)
             state.update({'link_active': True})
@@ -152,6 +184,12 @@ def mavlink_worker(endpoint, state):
 
             last_heartbeat = 0
             while True:
+                # Check if superseded
+                if state.current_worker_id != worker_id:
+                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Stopping MAVLink Worker {worker_id} (Superseded)")
+                    conn.close()
+                    return
+
                 # Check for pending mission upload
                 if not state.upload_queue.empty():
                     try:
@@ -292,7 +330,31 @@ def mavlink_worker(endpoint, state):
                         data['wp_current'] = wp_num
                         state.update({'wp_current': wp_num})
 
+                elif mtype == 'MISSION_ACK':
+                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Mission Ack: {msg.type} from {msg.get_srcSystem()}:{msg.get_srcComponent()}")
+
+                elif mtype == 'MISSION_REQUEST_INT' or mtype == 'MISSION_REQUEST':
+                     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Mission Request {msg.seq} from {msg.get_srcSystem()}:{msg.get_srcComponent()}")
+
                 elif mtype == 'MISSION_COUNT':
+                    src_sys = msg.get_srcSystem()
+                    src_comp = msg.get_srcComponent()
+                    
+                    # Check mission_type if available (MAVLink 2)
+                    m_type = getattr(msg, 'mission_type', 0)
+                    
+                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Mission Count: {msg.count} from {src_sys}:{src_comp} (Type: {m_type})")
+                    
+                    # Filter out messages from non-target components (e.g. cameras)
+                    if src_sys != conn.target_system or src_comp != conn.target_component:
+                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Ignored MISSION_COUNT from {src_sys}:{src_comp} (Target: {conn.target_system}:{conn.target_component})")
+                        continue
+                        
+                    # Filter out non-main mission types (e.g. Fence=1, Rally=2)
+                    if m_type != 0:
+                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Ignored MISSION_COUNT for type {m_type}")
+                        continue
+
                     _mission_cache = {}
                     _mission_total = msg.count
                     if _mission_total > 0:
@@ -301,10 +363,37 @@ def mavlink_worker(endpoint, state):
                         with state.acquire_mav_lock():
                             conn.mav.mission_request_int_send(conn.target_system, conn.target_component, 0)
                         mission_last_req_time = time.time()
+                    else:
+                        # Handle empty mission
+                        state.update({'mission_points': []})
+                        state.append_message("Mission loaded: 0 points")
+                        with state.acquire_mav_lock():
+                            conn.mav.mission_ack_send(conn.target_system, conn.target_component, 0)
 
-                elif mtype == 'MISSION_ITEM_INT':
+                elif mtype == 'MISSION_ITEM_INT' or mtype == 'MISSION_ITEM':
+                    src_sys = msg.get_srcSystem()
+                    src_comp = msg.get_srcComponent()
+                    
+                    if src_sys != conn.target_system or src_comp != conn.target_component:
+                        continue
+
+                    # Check mission_type if available
+                    m_type = getattr(msg, 'mission_type', 0)
+                    if m_type != 0:
+                        continue
+
+                    # Handle both INT and float versions
+                    if mtype == 'MISSION_ITEM_INT':
+                        lat = msg.x / 1e7
+                        lon = msg.y / 1e7
+                    else:
+                        lat = msg.x
+                        lon = msg.y
+                    
+                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Recv Item {msg.seq}: {lat}, {lon}")
+                    
                     # Store as [lon, lat] for PyDeck
-                    _mission_cache[msg.seq] = [msg.y / 1e7, msg.x / 1e7]
+                    _mission_cache[msg.seq] = [lon, lat]
                     
                     if msg.seq == mission_next_seq:
                         mission_next_seq += 1
@@ -410,34 +499,35 @@ def create_map_deck(data):
     mission_pts = data.get('mission_points', [])
     wp_current = data.get('wp_current', 0)
 
-    if mission_pts and len(mission_pts) > 1:
-        # Split into Completed (Green) and Pending (White)
-        split_idx = max(1, wp_current)
-        completed_path = mission_pts[:split_idx]
-        pending_path = mission_pts[split_idx-1:]
+    if mission_pts:
+        if len(mission_pts) > 1:
+            # Split into Completed (Green) and Pending (White)
+            split_idx = max(1, wp_current)
+            completed_path = mission_pts[:split_idx]
+            pending_path = mission_pts[split_idx-1:]
 
-        if len(completed_path) > 1:
-            layers.append(pdk.Layer(
-                "PathLayer",
-                data=[{"path": completed_path}],
-                get_path="path",
-                get_color=[0, 255, 0, 200], # Green line
-                width_min_pixels=1,
-                get_width=0.05,
-                width_units='"meters"',
-            ))
+            if len(completed_path) > 1:
+                layers.append(pdk.Layer(
+                    "PathLayer",
+                    data=[{"path": completed_path}],
+                    get_path="path",
+                    get_color=[0, 255, 0, 200], # Green line
+                    width_min_pixels=1,
+                    get_width=0.05,
+                    width_units='"meters"',
+                ))
 
-        if len(pending_path) > 1:
-            layers.append(pdk.Layer(
-                "PathLayer",
-                data=[{"path": pending_path}],
-                get_path="path",
-                get_color=[255, 255, 255, 200], # White line
-                width_min_pixels=1,
-                get_width=0.05,
-                width_units='"meters"',
-                dash_justified=True,
-            ))
+            if len(pending_path) > 1:
+                layers.append(pdk.Layer(
+                    "PathLayer",
+                    data=[{"path": pending_path}],
+                    get_path="path",
+                    get_color=[255, 255, 255, 200], # White line
+                    width_min_pixels=1,
+                    get_width=0.05,
+                    width_units='"meters"',
+                    dash_justified=True,
+                ))
 
         # Mission Waypoints (Dots)
         waypoint_data = []
@@ -541,6 +631,7 @@ if st.sidebar.button("Load Map", use_container_width=True, disabled=is_disabled)
             with get_shared_state().acquire_mav_lock():
                 cmd_conn.mav.mission_request_list_send(cmd_conn.target_system, cmd_conn.target_component)
             st.toast("Requesting Mission List...")
+            st.rerun()
         except Exception as e:
             st.error(f"Failed to load map: {e}")
 
