@@ -210,7 +210,7 @@ def mavlink_worker(endpoint, state):
                     last_heartbeat = time.time()
                 
                 # Mission Download Retry Logic
-                if mission_download_active and time.time() - mission_last_req_time > 1.0:
+                if mission_download_active and time.time() - mission_last_req_time > 0.5:
                     if mission_next_seq < _mission_total:
                         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Retry requesting mission item {mission_next_seq}")
                         with state.acquire_mav_lock():
@@ -355,6 +355,11 @@ def mavlink_worker(endpoint, state):
                         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Ignored MISSION_COUNT for type {m_type}")
                         continue
 
+                    # Prevent restarting download if already active for same count
+                    if mission_download_active and _mission_total == msg.count:
+                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Ignoring duplicate MISSION_COUNT (Already downloading)")
+                        continue
+
                     _mission_cache = {}
                     _mission_total = msg.count
                     if _mission_total > 0:
@@ -390,7 +395,9 @@ def mavlink_worker(endpoint, state):
                         lat = msg.x
                         lon = msg.y
                     
-                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Recv Item {msg.seq}: {lat}, {lon}")
+                    # Reduce logging verbosity
+                    if msg.seq % 10 == 0 or msg.seq == _mission_total - 1:
+                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Recv Item {msg.seq}/{_mission_total}: {lat}, {lon}")
                     
                     # Store as [lon, lat] for PyDeck
                     _mission_cache[msg.seq] = [lon, lat]
@@ -503,8 +510,10 @@ def create_map_deck(data):
         if len(mission_pts) > 1:
             # Split into Completed (Green) and Pending (White)
             split_idx = max(1, wp_current)
-            completed_path = mission_pts[:split_idx]
-            pending_path = mission_pts[split_idx-1:]
+            # Start from index 1 to exclude Home
+            completed_path = mission_pts[1:split_idx]
+            # Ensure pending starts at least at index 1
+            pending_path = mission_pts[max(1, split_idx-1):]
 
             if len(completed_path) > 1:
                 layers.append(pdk.Layer(
@@ -532,6 +541,9 @@ def create_map_deck(data):
         # Mission Waypoints (Dots)
         waypoint_data = []
         for i, p in enumerate(mission_pts):
+            # Skip Home (Index 0)
+            if i == 0:
+                continue
             # Green for completed (index < current), White for pending
             color = [0, 255, 0, 255] if i < wp_current else [255, 255, 255, 255]
             waypoint_data.append({"pos": p, "color": color})
