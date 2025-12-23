@@ -62,7 +62,7 @@ class SharedState:
             self.rover_data['last_update'] = time.time()
 
     def append_message(self, msg_text):
-        print(f"[Rover Message] {msg_text}")
+        print(f"[Rover Message {threading.get_ident()}] {msg_text}")
         with self.lock:
             msg_text = str(msg_text).strip()
 

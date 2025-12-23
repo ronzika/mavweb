@@ -25,6 +25,7 @@ load_dotenv(dotenv_path=env_path, override=True)
 
 MAVLINK_ENDPOINT = os.getenv("MAVLINK_ENDPOINT", "udpin:0.0.0.0:14550")
 MAPBOX_API_KEY = os.getenv("MAPBOX_API_KEY")
+DEBUG = os.getenv("DEBUG", "0") != "0"
 
 # Debug Mapbox Key
 if MAPBOX_API_KEY:
@@ -318,6 +319,17 @@ def mavlink_worker(endpoint, state):
                     txt = str(msg.text)
                     state.append_message(txt)
                     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [STATUSTEXT] setting {txt}")
+                    
+                    # Auto-reset mission when complete
+                    if "Mission Complete" in txt:
+                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Mission Complete detected. Resetting WP to 0.")
+                        try:
+                            with state.acquire_mav_lock():
+                                conn.mav.mission_set_current_send(conn.target_system, conn.target_component, 0)
+                            state.append_message("Mission Reset to WP 0")
+                        except Exception as e:
+                            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Failed to reset mission: {e}")
+
                     # Parse "Mission: #" messages (ArduPilot)
                     # Also handle "Reached command #"
                     wp_num = -1
@@ -341,10 +353,10 @@ def mavlink_worker(endpoint, state):
                         state.update({'wp_current': wp_num})
 
                 elif mtype == 'MISSION_ACK':
-                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Mission Ack: {msg.type} from {msg.get_srcSystem()}:{msg.get_srcComponent()}")
+                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK {threading.get_ident()}] Mission Ack: {msg.type} from {msg.get_srcSystem()}:{msg.get_srcComponent()}")
 
                 elif mtype == 'MISSION_REQUEST_INT' or mtype == 'MISSION_REQUEST':
-                     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Mission Request {msg.seq} from {msg.get_srcSystem()}:{msg.get_srcComponent()}")
+                     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK {threading.get_ident()}] Mission Request {msg.seq} from {msg.get_srcSystem()}:{msg.get_srcComponent()}")
 
                 elif mtype == 'MISSION_COUNT':
                     src_sys = msg.get_srcSystem()
@@ -372,20 +384,30 @@ def mavlink_worker(endpoint, state):
 
                     _mission_cache = {}
                     _mission_total = msg.count
+                    if DEBUG:
+                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: Received MISSION_COUNT {_mission_total}. Starting download.")
                     if _mission_total > 0:
                         mission_download_active = True
                         mission_next_seq = 0
                         with state.acquire_mav_lock():
                             conn.mav.mission_request_int_send(conn.target_system, conn.target_component, 0)
                         mission_last_req_time = time.time()
+                        if DEBUG:
+                            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: Requested item 0.")
                     else:
                         # Handle empty mission
                         state.update({'mission_points': []})
                         state.append_message("Mission loaded: 0 points")
                         with state.acquire_mav_lock():
                             conn.mav.mission_ack_send(conn.target_system, conn.target_component, 0)
+                        if DEBUG:
+                            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: Empty mission. Sent ACK.")
 
                 elif mtype == 'MISSION_ITEM_INT' or mtype == 'MISSION_ITEM':
+                    # Ignore stray mission items if we aren't actively downloading
+                    if not mission_download_active:
+                        continue
+
                     src_sys = msg.get_srcSystem()
                     src_comp = msg.get_srcComponent()
                     
@@ -404,12 +426,9 @@ def mavlink_worker(endpoint, state):
                     else:
                         lat = msg.x
                         lon = msg.y
-                    
-                    # Reduce logging verbosity
-                    if msg.seq % 10 == 0 or msg.seq == _mission_total - 1:
-                        pass
-                        # print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Recv Item {msg.seq}/{_mission_total}: {lat}, {lon}")
-                    
+                    if DEBUG:
+                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: Received item {msg.seq}/{_mission_total}: {lat}, {lon}")
+
                     # Store as [lon, lat] for PyDeck
                     _mission_cache[msg.seq] = [lon, lat]
                     
@@ -420,6 +439,8 @@ def mavlink_worker(endpoint, state):
                         with state.acquire_mav_lock():
                             conn.mav.mission_request_int_send(conn.target_system, conn.target_component, mission_next_seq)
                         mission_last_req_time = time.time()
+                        if DEBUG:
+                            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: Requested item {mission_next_seq}.")
                     elif mission_download_active:
                         mission_download_active = False
                         sorted_pts = [v for k, v in sorted(_mission_cache.items())]
@@ -427,6 +448,8 @@ def mavlink_worker(endpoint, state):
                         state.append_message(f"Mission loaded: {len(sorted_pts)} points")
                         with state.acquire_mav_lock():
                             conn.mav.mission_ack_send(conn.target_system, conn.target_component, 0)
+                        if DEBUG:
+                            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: Download complete. Updated state with {len(sorted_pts)} points. Sent ACK.")
 
                 if data:
                     state.update(data)
@@ -483,9 +506,17 @@ def generate_sparkline(data, width=280, height=40, color="#4caf50"):
 
 # --- UI Functions ---
 def create_map_deck(data, map_style='mapbox://styles/mapbox/satellite-v9'):
+    # if DEBUG:
+    #     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG] Map: Creating map deck.")
     lat, lon = data.get('lat'), data.get('lon')
     if not lat or lat == 0:
+        if DEBUG:
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG] Map: No valid lat/lon. Skipping.")
         return None
+
+    # Guard against lat=90/-90 for math.cos
+    if abs(lat) > 89.9:
+        lat = 89.9 if lat > 0 else -89.9
 
     view_state = pdk.ViewState(latitude=lat, longitude=lon, zoom=19, pitch=0)
     
@@ -502,6 +533,12 @@ def create_map_deck(data, map_style='mapbox://styles/mapbox/satellite-v9'):
 
     # Breadcrumbs Path
     history = data.get('history', [])
+    # Limit history rendering to prevent browser crash
+    if len(history) > 2000:
+        # Downsample
+        step = len(history) // 2000 + 1
+        history = history[::step]
+
     if len(history) > 1:
         layers.append(pdk.Layer(
             "PathLayer",
@@ -518,13 +555,20 @@ def create_map_deck(data, map_style='mapbox://styles/mapbox/satellite-v9'):
     wp_current = data.get('wp_current', 0)
 
     if mission_pts:
-        if len(mission_pts) > 1:
+        # mission_pts from worker are already [lon, lat]
+        # Also limit points
+        if len(mission_pts) > 2000:
+             mission_pts = mission_pts[:2000] # Truncate for safety
+        
+        mission_pts_lonlat = mission_pts
+
+        if len(mission_pts_lonlat) > 1:
             # Split into Completed (Green) and Pending (White)
             split_idx = max(1, wp_current)
             # Start from index 1 to exclude Home
-            completed_path = mission_pts[1:split_idx]
+            completed_path = mission_pts_lonlat[1:split_idx]
             # Ensure pending starts at least at index 1
-            pending_path = mission_pts[max(1, split_idx-1):]
+            pending_path = mission_pts_lonlat[max(1, split_idx-1):]
 
             if len(completed_path) > 1:
                 layers.append(pdk.Layer(
@@ -551,7 +595,7 @@ def create_map_deck(data, map_style='mapbox://styles/mapbox/satellite-v9'):
 
         # Mission Waypoints (Dots)
         waypoint_data = []
-        for i, p in enumerate(mission_pts):
+        for i, p in enumerate(mission_pts_lonlat):
             # Skip Home (Index 0)
             if i == 0:
                 continue
@@ -734,89 +778,95 @@ if 'history' not in st.session_state:
 
 print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] Starting main update loop...")
 # --- Update Loop ---
-while True:
-    current_data = get_shared_state().get()
+try:
+    while True:
+        current_data = get_shared_state().get()
 
-    # Auto-refresh if connection state changes to update UI buttons
-    if is_disabled and current_data.get('link_active'):
-        st.rerun()
-    elif not is_disabled and not current_data.get('link_active'):
-        st.rerun()
+        # Auto-refresh if connection state changes to update UI buttons
+        if is_disabled and current_data.get('link_active'):
+            st.rerun()
+        elif not is_disabled and not current_data.get('link_active'):
+            st.rerun()
+        
+        # Update History (Breadcrumbs)
+        lat = current_data.get('lat')
+        lon = current_data.get('lon')
+        if lat and lon and lat != 0 and lon != 0:
+            history = st.session_state.history
+            if not history or (abs(history[-1][0] - lon) > 1e-7 or abs(history[-1][1] - lat) > 1e-7):
+                history.append([lon, lat])
+                if len(history) > 5000:
+                    history.pop(0)
+        
+        # Inject history into data for map creation
+        current_data['history'] = st.session_state.history
     
-    # Update History (Breadcrumbs)
-    lat = current_data.get('lat')
-    lon = current_data.get('lon')
-    if lat and lon and lat != 0 and lon != 0:
-        history = st.session_state.history
-        if not history or (abs(history[-1][0] - lon) > 1e-7 or abs(history[-1][1] - lat) > 1e-7):
-            history.append([lon, lat])
-            if len(history) > 5000:
-                history.pop(0)
+        # Sidebar Status
+        if current_data.get('link_active'):
+            sidebar_status_ph.markdown(f"✅ **ONLINE**<br><span style='font-size:0.8em; color:gray'>Last Update: {datetime.datetime.now().strftime('%H:%M:%S')}</span>", unsafe_allow_html=True)
+        else:
+            sidebar_status_ph.error("OFFLINE: Searching...")
     
-    # Inject history into data for map creation
-    current_data['history'] = st.session_state.history
-
-    # Sidebar Status
-    if current_data.get('link_active'):
-        sidebar_status_ph.markdown(f"✅ **ONLINE**<br><span style='font-size:0.8em; color:gray'>Last Update: {datetime.datetime.now().strftime('%H:%M:%S')}</span>", unsafe_allow_html=True)
-    else:
-        sidebar_status_ph.error("OFFLINE: Searching...")
-
-    # Sidebar GPS
-    lq = current_data.get('link_quality', 100)
-    lq_color = "#4caf50" if lq >= 90 else "#ff9800" if lq >= 70 else "#f44336"
+        # Sidebar GPS
+        lq = current_data.get('link_quality', 100)
+        lq_color = "#4caf50" if lq >= 90 else "#ff9800" if lq >= 70 else "#f44336"
+        
+        # Render Sparkline
+        lq_hist = current_data.get('link_quality_history', [])
+        sparkline_svg = generate_sparkline(lq_hist, color=lq_color)
+        sidebar_sparkline_ph.markdown(sparkline_svg, unsafe_allow_html=True)
     
-    # Render Sparkline
-    lq_hist = current_data.get('link_quality_history', [])
-    sparkline_svg = generate_sparkline(lq_hist, color=lq_color)
-    sidebar_sparkline_ph.markdown(sparkline_svg, unsafe_allow_html=True)
-
-    gps_html = f"""
-<div style="line-height: 1.2; font-size: 0.9rem;">
-    <b>Link Quality:</b> <span style="color:{lq_color}; font-weight:bold;">{lq}%</span><br>
-    <hr style="margin: 5px 0; border-color: #333;">
-    <b>GPS 1:</b> {current_data.get('gps1_fix')}<br>
-    Lat: {current_data.get('lat') or 'N/A'}<br>
-    Lon: {current_data.get('lon') or 'N/A'}<br>
-    Sats: {current_data.get('satellites_visible')}
-</div>
-"""
-    if current_data.get('gps2_fix'):
-        gps_html += f"""
-<hr>
-<div style="line-height: 1.2; font-size: 0.9rem;">
-    <b>GPS 2:</b> {current_data.get('gps2_fix')}<br>
-    Lat: {current_data.get('gps2_lat') or 'N/A'}<br>
-    Lon: {current_data.get('gps2_lon') or 'N/A'}<br>
-    Sats: {current_data.get('gps2_satellites_visible')}
-</div>
-"""
-    sidebar_gps_ph.markdown(gps_html, unsafe_allow_html=True)
-
-    # Metrics
-    metric_mode.metric("Mode", current_data.get('mode'))
-    metric_armed.metric("Armed", "ARMED" if current_data.get('armed') else "DISARMED")
-    metric_speed.metric("Speed", f"{current_data.get('speed_ms')} m/s")
-    metric_gps.metric("GPS", current_data.get('gps1_fix'))
-    metric_battery.metric("Battery", f"{current_data.get('battery_v')}V")
-    metric_wp.metric("WP", f"{current_data.get('wp_current', 0)}")
-
-    # Map
-    deck = create_map_deck(current_data, selected_map_style)
-    if deck:
-        # Use a stable key that only changes when the style changes
-        # This prevents the map from reloading tiles every second
-        map_key = f"map_{map_style_name}"
-        map_placeholder.pydeck_chart(deck, key=map_key, width="stretch")
-    else:
-        map_placeholder.info("🛰️ Waiting for GPS Position...")
-
-    # Console
-    msg_log = "<br>".join(current_data.get('messages', []))
-    console_placeholder.markdown(f"""
-        <div style="height:200px; overflow-y:auto; background-color:#0e1117; border:1px solid #30363d; padding:10px; color:#58a6ff; font-family:monospace; font-size:0.8rem;">
-            {msg_log}
-        </div>
-    """, unsafe_allow_html=True)
-
-    time.sleep(1)
+        gps_html = f"""
+    <div style="line-height: 1.2; font-size: 0.9rem;">
+        <b>Link Quality:</b> <span style="color:{lq_color}; font-weight:bold;">{lq}%</span><br>
+        <hr style="margin: 5px 0; border-color: #333;">
+        <b>GPS 1:</b> {current_data.get('gps1_fix')}<br>
+        Lat: {current_data.get('lat') or 'N/A'}<br>
+        Lon: {current_data.get('lon') or 'N/A'}<br>
+        Sats: {current_data.get('satellites_visible')}
+    </div>
+    """
+        if current_data.get('gps2_fix'):
+            gps_html += f"""
+    <hr>
+    <div style="line-height: 1.2; font-size: 0.9rem;">
+        <b>GPS 2:</b> {current_data.get('gps2_fix')}<br>
+        Lat: {current_data.get('gps2_lat') or 'N/A'}<br>
+        Lon: {current_data.get('gps2_lon') or 'N/A'}<br>
+        Sats: {current_data.get('gps2_satellites_visible')}
+    </div>
+    """
+        sidebar_gps_ph.markdown(gps_html, unsafe_allow_html=True)
+    
+        # Metrics
+        metric_mode.metric("Mode", current_data.get('mode'))
+        metric_armed.metric("Armed", "ARMED" if current_data.get('armed') else "DISARMED")
+        metric_speed.metric("Speed", f"{current_data.get('speed_ms')} m/s")
+        metric_gps.metric("GPS", current_data.get('gps1_fix'))
+        metric_battery.metric("Battery", f"{current_data.get('battery_v')}V")
+        metric_wp.metric("WP", f"{current_data.get('wp_current', 0)}")
+    
+        # Map
+        deck = create_map_deck(current_data, selected_map_style)
+        if deck:
+            # Use a stable key that only changes when the style changes
+            # This prevents the map from reloading tiles every second
+            map_key = f"map_{map_style_name}"
+            map_placeholder.pydeck_chart(deck, key=map_key, width="stretch")
+        else:
+            map_placeholder.info("🛰️ Waiting for GPS Position...")
+    
+        # Console
+        msg_log = "<br>".join(current_data.get('messages', []))
+        console_placeholder.markdown(f"""
+            <div style="height:200px; overflow-y:auto; background-color:#0e1117; border:1px solid #30363d; padding:10px; color:#58a6ff; font-family:monospace; font-size:0.8rem;">
+                {msg_log}
+            </div>
+        """, unsafe_allow_html=True)
+    
+        time.sleep(1)
+    
+except Exception as e:
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] Main loop stopped: {e}")
+except KeyboardInterrupt:
+    pass
