@@ -699,6 +699,29 @@ if st.sidebar.button("Disarm", use_container_width=True, disabled=is_disabled):
         except Exception as e:
             st.error(f"Failed to disarm: {e}")
 
+if st.sidebar.button("Skip WP", use_container_width=True, disabled=is_disabled):
+    if cmd_conn:
+        try:
+            data = get_shared_state().get()
+            wp_current = data.get('wp_current', 0)
+            mission_pts = data.get('mission_points', [])
+            total_wp = len(mission_pts)
+            
+            if total_wp > 0:
+                next_wp = min(wp_current + 1, max(0, total_wp - 1))
+                with get_shared_state().acquire_mav_lock():
+                    cmd_conn.mav.mission_set_current_send(
+                        cmd_conn.target_system,
+                        cmd_conn.target_component,
+                        int(next_wp)
+                    )
+                st.toast(f"Skipped to WP {next_wp}")
+                get_shared_state().append_message(f"[UI] Skipped to WP {next_wp}")
+            else:
+                st.warning("No mission loaded.")
+        except Exception as e:
+            st.error(f"Failed to skip waypoint: {e}")
+
 if st.sidebar.button("Load Map", use_container_width=True, disabled=is_disabled):
     if cmd_conn:
         try:
@@ -711,8 +734,7 @@ if st.sidebar.button("Load Map", use_container_width=True, disabled=is_disabled)
 
 st.sidebar.divider()
 st.sidebar.subheader("Map Settings")
-# Default to "Dark" (Index 3) to match previous behavior
-map_style_name = st.sidebar.selectbox("Map Style", ["Satellite", "Satellite Streets", "Streets", "Dark", "Light", "Outdoors"], index=3, disabled=False, key="map_style_select_fixed")
+
 map_styles = {
     "Satellite": "mapbox://styles/mapbox/satellite-v9",
     "Satellite Streets": "mapbox://styles/mapbox/satellite-streets-v12",
@@ -721,6 +743,23 @@ map_styles = {
     "Light": "mapbox://styles/mapbox/light-v10",
     "Outdoors": "mapbox://styles/mapbox/outdoors-v11"
 }
+map_options = list(map_styles.keys())
+
+# Initialize session state for map style index if not present
+if "map_style_ind" not in st.session_state:
+    st.session_state["map_style_ind"] = 3
+
+def update_map_style():
+    st.session_state["map_style_ind"] = map_options.index(st.session_state["map_style_select_fixed"])
+
+map_style_name = st.sidebar.selectbox(
+    "Map Style", 
+    map_options, 
+    index=st.session_state["map_style_ind"], 
+    disabled=False, 
+    key="map_style_select_fixed",
+    on_change=update_map_style
+)
 selected_map_style = map_styles[map_style_name]
 
 if is_disabled:
