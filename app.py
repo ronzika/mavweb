@@ -722,7 +722,7 @@ if st.sidebar.button("Skip WP", use_container_width=True, disabled=is_disabled):
         except Exception as e:
             st.error(f"Failed to skip waypoint: {e}")
 
-if st.sidebar.button("Load Map", use_container_width=True, disabled=is_disabled):
+if st.sidebar.button("Fetch Mission", use_container_width=True, disabled=is_disabled):
     if cmd_conn:
         try:
             with get_shared_state().acquire_mav_lock():
