@@ -7,6 +7,7 @@ import time
 import math
 import threading
 import datetime
+import logging
 from pathlib import Path
 
 import uuid
@@ -15,8 +16,10 @@ import pydeck as pdk
 import streamlit as st
 from dotenv import load_dotenv
 from pymavlink import mavutil
+from pymavlink import mavftp
 from shared_state import get_shared_state
 from mavlink_utils import upload_mission
+import mavsdk_mission
 
 # --- Configuration ---
 env_path = Path(__file__).parent / '.env'
@@ -26,6 +29,14 @@ load_dotenv(dotenv_path=env_path, override=True)
 MAVLINK_ENDPOINT = os.getenv("MAVLINK_ENDPOINT", "udpin:0.0.0.0:14550")
 MAPBOX_API_KEY = os.getenv("MAPBOX_API_KEY")
 DEBUG = os.getenv("DEBUG", "0") != "0"
+MAVSDK_SYSTEM_ADDRESS = (os.getenv("MAVSDK_SYSTEM_ADDRESS", "") or "udp://:14540").strip()
+
+# Mission transfer tuning (speed)
+# For maximum speed with a single port/connection, prefer the MAVLink mission protocol over the existing conn.
+MISSION_FETCH_METHOD = (os.getenv("MISSION_FETCH_METHOD", "mavlink") or "mavlink").strip().lower()
+MISSION_RETRY_INTERVAL_S = float(os.getenv("MISSION_RETRY_INTERVAL_S", "0.2") or 0.2)
+WORKER_RECV_TIMEOUT_S = float(os.getenv("WORKER_RECV_TIMEOUT_S", "0.1") or 0.1)
+MISSION_PROGRESS_GRACE_S = float(os.getenv("MISSION_PROGRESS_GRACE_S", "3") or 3)
 
 # Debug Mapbox Key
 if MAPBOX_API_KEY:
@@ -96,6 +107,248 @@ def request_message_interval(conn, msg_id, hz):
         )
     except Exception:
         pass
+
+
+def _parse_qgc_wpl_text_to_lonlat(text: str) -> list[list[float]]:
+    """Parse QGroundControl WPL text into [[lon, lat], ...] points.
+
+    Returns an empty list if parsing fails.
+    """
+    try:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith('#')]
+        if not lines or not lines[0].startswith('QGC WPL'):
+            return []
+        points: list[list[float]] = []
+        # Format: seq, current, frame, command, param1..param4, x(lat), y(lon), z(alt), autocontinue
+        for ln in lines[1:]:
+            cols = ln.split('\t')
+            if len(cols) < 12:
+                continue
+            try:
+                lat = float(cols[8])
+                lon = float(cols[9])
+            except Exception:
+                continue
+            if abs(lat) < 1e-9 and abs(lon) < 1e-9:
+                continue
+            points.append([lon, lat])
+        return points
+    except Exception:
+        return []
+
+
+def _try_fetch_mission_via_mavftp(conn) -> list[list[float]]:
+    """Best-effort mission download via MAVFTP.
+
+    ArduPilot exposes some configuration objects through MAVFTP depending on version/build.
+    We try a few common/special paths and parse QGC WPL if returned.
+
+    Returns [[lon, lat], ...] or [] on failure.
+    """
+    # MAVFTP needs explicit target ids
+    tsys = getattr(conn, 'target_system', None)
+    tcomp = getattr(conn, 'target_component', None)
+    if tsys is None or tcomp is None:
+        return []
+
+    ftp = mavftp.MAVFTP(conn, tsys, tcomp)
+
+    # Optional override if you know the exact remote path.
+    override_path = (os.getenv("MAVFTP_MISSION_PATH", "") or os.getenv("MAVFTP_MISSION_FILE", "")).strip()
+
+    # Reduce spammy OpenFileRO warnings unless DEBUG is enabled.
+    root_logger = logging.getLogger()
+    prev_level = root_logger.level
+    if not DEBUG:
+        root_logger.setLevel(logging.ERROR)
+
+    try:
+        # Try in this order:
+        #  1) explicit override (if provided)
+        #  2) discovered files from directory listings (most likely to exist)
+        #  3) a small set of common guessed paths
+        candidates: list[str] = []
+
+        # Common/special paths and filesystem-like locations used by some firmwares.
+        common_guesses = [
+            "@MISSION",
+            "@MISSION/mission.waypoints",
+            "@MISSION/mission.txt",
+            "/APM/mission.waypoints",
+            "/APM/mission.txt",
+            "/mission.waypoints",
+            "/mission.txt",
+            "/fs/microsd/APM/mission.waypoints",
+            "/fs/microsd/APM/mission.txt",
+        ]
+
+        def _list_dir(d: str):
+            try:
+                ftp.cmd_list([d])
+                entries = getattr(ftp, 'list_result', []) or []
+                if DEBUG:
+                    names = []
+                    for ent in entries:
+                        try:
+                            prefix = "D" if ent.is_dir else "F"
+                            names.append(f"{prefix}:{ent.name}")
+                        except Exception:
+                            continue
+                    max_show = 40
+                    shown = names[:max_show]
+                    suffix = "" if len(names) <= max_show else f" ... (+{len(names) - max_show} more)"
+                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] MAVFTP list {d}: {shown}{suffix}")
+                return entries
+            except Exception:
+                return []
+
+        def _join(d: str, name: str) -> str:
+            if d == '/':
+                return f"/{name}"
+            return f"{d.rstrip('/')}/{name}"
+
+        # Discover mission-like files by listing visible directories (bounded).
+        discovered: list[tuple[str, int]] = []  # (full_path, size)
+
+        # Start at root and include common firmware dirs.
+        base_dirs = ["/", "/APM", "/fs", "/fs/microsd", "/fs/microsd/APM"]
+        root_entries = _list_dir('/')
+        for ent in root_entries:
+            try:
+                if ent.is_dir and ent.name not in ('.', '..'):
+                    # Avoid very large/slow listings that can time out (e.g. /logs)
+                    nm_l = (ent.name or '').lower()
+                    if nm_l in ('logs',):
+                        continue
+                    # ArduPilot often exposes virtual dirs like @SYS and @ROMFS
+                    base_dirs.append(_join('/', ent.name))
+            except Exception:
+                continue
+
+        # De-dup base dirs
+        seen_dirs: set[str] = set()
+        dirs_to_probe: list[str] = []
+        for d in base_dirs:
+            if d not in seen_dirs:
+                seen_dirs.add(d)
+                dirs_to_probe.append(d)
+
+        # Probe up to 2 levels deep in selected dirs
+        def _looks_like_mission_file(name_l: str) -> bool:
+            if not (name_l.endswith('.txt') or name_l.endswith('.waypoints')):
+                return False
+            return ('mission' in name_l) or ('waypoint' in name_l) or name_l.endswith('.waypoints')
+
+        def _parent_dir_and_name(p: str) -> tuple[str, str]:
+            p = (p or '').strip()
+            if not p or p.endswith('/'):
+                return ("", "")
+            if '/' not in p:
+                # e.g. "@MISSION" (treated as name in root-like namespace)
+                return ("/", p)
+            parent, name = p.rsplit('/', 1)
+            if parent == '':
+                parent = '/'
+            return (parent, name)
+
+        def _dir_has_file(d: str, name: str) -> bool:
+            if not d or not name:
+                return False
+            for ent in _list_dir(d):
+                try:
+                    if not ent.is_dir and ent.name == name:
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        # First level scan
+        next_level_dirs: list[str] = []
+        for d in dirs_to_probe:
+            for ent in _list_dir(d):
+                try:
+                    if ent.is_dir:
+                        nm = ent.name
+                        if nm in ('.', '..'):
+                            continue
+                        # Only recurse into a small set to avoid slow walk
+                        nm_l = (nm or '').lower()
+                        if nm_l in ('apm', 'missions', 'mission', 'wp', 'waypoints') or nm_l.startswith('@'):
+                            next_level_dirs.append(_join(d, nm))
+                        continue
+                    name = ent.name or ""
+                    name_l = name.lower()
+                    if _looks_like_mission_file(name_l):
+                        full = _join(d, name)
+                        discovered.append((full, int(getattr(ent, 'size_b', 0) or 0)))
+                except Exception:
+                    continue
+
+        # Second level scan (bounded)
+        seen_lvl2: set[str] = set()
+        for d in next_level_dirs:
+            if d in seen_lvl2:
+                continue
+            seen_lvl2.add(d)
+            for ent in _list_dir(d):
+                try:
+                    if ent.is_dir:
+                        continue
+                    name = ent.name or ""
+                    name_l = name.lower()
+                    if _looks_like_mission_file(name_l):
+                        full = _join(d, name)
+                        discovered.append((full, int(getattr(ent, 'size_b', 0) or 0)))
+                except Exception:
+                    continue
+
+        # Prefer larger mission-like files (often the actual mission).
+        discovered_paths: list[str] = []
+        if discovered:
+            discovered.sort(key=lambda t: t[1], reverse=True)
+            discovered_paths = [p for p, _sz in discovered]
+
+        if override_path:
+            candidates.append(override_path)
+        candidates.extend(discovered_paths)
+        candidates.extend(common_guesses)
+
+        # Deduplicate while preserving order, and cap attempts to avoid long blocking.
+        seen: set[str] = set()
+        uniq_candidates: list[str] = []
+        for c in candidates:
+            if not c or c in seen:
+                continue
+            seen.add(c)
+            uniq_candidates.append(c)
+            if len(uniq_candidates) >= 12:
+                break
+
+        if DEBUG:
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] MAVFTP mission candidates: {uniq_candidates}")
+
+        for path in uniq_candidates:
+            try:
+                # Avoid OpenFileRO spam by first confirming the file exists via directory listing.
+                parent, name = _parent_dir_and_name(path)
+                if parent and name:
+                    if not _dir_has_file(parent, name):
+                        continue
+                blob = ftp.read(path, size=256 * 1024, offset=0)
+                if not blob:
+                    continue
+                text = blob.decode('utf-8', errors='ignore')
+                pts = _parse_qgc_wpl_text_to_lonlat(text)
+                if pts:
+                    if DEBUG:
+                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] MAVFTP mission parsed from {path}: {len(pts)} points")
+                    return pts
+            except Exception:
+                continue
+        return []
+    finally:
+        if not DEBUG:
+            root_logger.setLevel(prev_level)
 
 # --- MAVLink Worker (Background Thread) ---
 def mavlink_worker(endpoint, state):
@@ -201,19 +454,95 @@ def mavlink_worker(endpoint, state):
                     conn.close()
                     return
 
+                # Handle mission fetch requests
+                try:
+                    if not state.mission_fetch_queue.empty():
+                        # Drain queue; one fetch satisfies all pending clicks
+                        while not state.mission_fetch_queue.empty():
+                            _ = state.mission_fetch_queue.get_nowait()
+
+                        state.append_message("Fetching mission...")
+                        if DEBUG:
+
+                            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: Mission fetch requested")
+
+                        method = MISSION_FETCH_METHOD
+
+                        # Fast default: use MAVLink mission protocol over the already-open connection.
+                        if method == "mavlink":
+                            with state.acquire_mav_lock():
+                                conn.mav.mission_request_list_send(conn.target_system, conn.target_component)
+                            mission_download_active = True
+                            mission_next_seq = 0
+                            mission_last_req_time = time.time()
+                            state.update({'mission_dl_active': True, 'mission_dl_total': 0, 'mission_dl_received': 0, 'mission_dl_done_ts': 0.0})
+                        elif method == "mavftp":
+                            pts: list[list[float]] = []
+                            try:
+                                with state.acquire_mav_lock():
+                                    pts = _try_fetch_mission_via_mavftp(conn)
+                            except Exception as e:
+                                if DEBUG:
+                                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: MAVFTP fetch error: {e}")
+                            if pts:
+                                state.update({'mission_points': pts})
+                                state.append_message(f"Mission loaded via MAVFTP: {len(pts)} points")
+                            else:
+                                state.append_message("MAVFTP mission fetch failed; using MAVLink mission protocol...")
+                                with state.acquire_mav_lock():
+                                    conn.mav.mission_request_list_send(conn.target_system, conn.target_component)
+                                mission_download_active = True
+                                mission_next_seq = 0
+                                mission_last_req_time = time.time()
+                                state.update({'mission_dl_active': True, 'mission_dl_total': 0, 'mission_dl_received': 0, 'mission_dl_done_ts': 0.0})
+                        else:
+                            # Opt-in: MAVSDK (requires its own connection/port)
+                            pts: list[list[float]] = []
+                            try:
+                                if MAVSDK_SYSTEM_ADDRESS:
+                                    if DEBUG:
+                                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: MAVSDK download_mission via {MAVSDK_SYSTEM_ADDRESS}")
+                                    pts = mavsdk_mission.download_mission_points_sync(MAVSDK_SYSTEM_ADDRESS, timeout_s=10.0)
+                            except Exception as e:
+                                if DEBUG:
+                                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: MAVSDK mission download failed: {e}")
+                            if pts:
+                                state.update({'mission_points': pts})
+                                state.append_message(f"Mission loaded via MAVSDK: {len(pts)} points")
+                            else:
+                                state.append_message("MAVSDK mission download failed; using MAVLink mission protocol...")
+                                with state.acquire_mav_lock():
+                                    conn.mav.mission_request_list_send(conn.target_system, conn.target_component)
+                                mission_download_active = True
+                                mission_next_seq = 0
+                                mission_last_req_time = time.time()
+                                state.update({'mission_dl_active': True, 'mission_dl_total': 0, 'mission_dl_received': 0, 'mission_dl_done_ts': 0.0})
+                except Exception:
+                    pass
+
                 # Check for pending mission upload
                 if not state.upload_queue.empty():
                     try:
                         mission_items = state.upload_queue.get_nowait()
                         state.set_upload_status('uploading', 'Starting upload...')
+                        state.update({'mission_ul_active': True, 'mission_ul_total': len(mission_items), 'mission_ul_sent': 0, 'mission_ul_done_ts': 0.0})
+
+                        def _upload_progress(sent: int, total: int):
+                            # Keep updates cheap; UI reads from shared state.
+                            state.update({'mission_ul_active': True, 'mission_ul_total': int(total), 'mission_ul_sent': int(sent)})
+                            state.set_upload_status('uploading', f'Uploading {sent}/{total}...')
+
                         # Use the existing connection to upload
-                        success = upload_mission(conn, mission_items)
+                        success = upload_mission(conn, mission_items, progress_cb=_upload_progress)
                         if success:
                             state.set_upload_status('success', 'Upload complete!')
+                            state.update({'mission_ul_active': False, 'mission_ul_done_ts': time.time()})
                         else:
                             state.set_upload_status('error', 'Upload failed.')
+                            state.update({'mission_ul_active': False, 'mission_ul_done_ts': time.time()})
                     except Exception as e:
                         state.set_upload_status('error', f'Upload error: {e}')
+                        state.update({'mission_ul_active': False, 'mission_ul_done_ts': time.time()})
 
                 # Send Heartbeat to GCS every 1s
                 if time.time() - last_heartbeat > 1.0:
@@ -221,7 +550,7 @@ def mavlink_worker(endpoint, state):
                     last_heartbeat = time.time()
                 
                 # Mission Download Retry Logic
-                if mission_download_active and time.time() - mission_last_req_time > 0.5:
+                if mission_download_active and time.time() - mission_last_req_time > MISSION_RETRY_INTERVAL_S:
                     if mission_next_seq < _mission_total:
                         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Retry requesting mission item {mission_next_seq}")
                         with state.acquire_mav_lock():
@@ -230,7 +559,7 @@ def mavlink_worker(endpoint, state):
                     else:
                         mission_download_active = False
 
-                msg = conn.recv_match(blocking=True, timeout=0.5)
+                msg = conn.recv_match(blocking=True, timeout=WORKER_RECV_TIMEOUT_S)
                 if not msg:
                     # Check for link timeout
                     if time.time() - state.get()['last_update'] > 5:
@@ -384,6 +713,7 @@ def mavlink_worker(endpoint, state):
 
                     _mission_cache = {}
                     _mission_total = msg.count
+                    state.update({'mission_dl_active': True, 'mission_dl_total': int(_mission_total), 'mission_dl_received': 0, 'mission_dl_done_ts': 0.0})
                     if DEBUG:
                         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: Received MISSION_COUNT {_mission_total}. Starting download.")
                     if _mission_total > 0:
@@ -431,6 +761,11 @@ def mavlink_worker(endpoint, state):
 
                     # Store as [lon, lat] for PyDeck
                     _mission_cache[msg.seq] = [lon, lat]
+                    # Progress
+                    try:
+                        state.update({'mission_dl_received': int(len(_mission_cache))})
+                    except Exception:
+                        pass
                     
                     if msg.seq == mission_next_seq:
                         mission_next_seq += 1
@@ -445,6 +780,7 @@ def mavlink_worker(endpoint, state):
                         mission_download_active = False
                         sorted_pts = [v for k, v in sorted(_mission_cache.items())]
                         state.update({'mission_points': sorted_pts})
+                        state.update({'mission_dl_active': False, 'mission_dl_total': int(_mission_total), 'mission_dl_received': int(len(sorted_pts)), 'mission_dl_done_ts': time.time()})
                         state.append_message(f"Mission loaded: {len(sorted_pts)} points")
                         with state.acquire_mav_lock():
                             conn.mav.mission_ack_send(conn.target_system, conn.target_component, 0)
@@ -462,6 +798,7 @@ def mavlink_worker(endpoint, state):
 
 @st.cache_resource
 def start_background_threads():
+    print("Starting background MAVLink worker thread...")
     shared_state = get_shared_state()
     t = threading.Thread(
         target=mavlink_worker, 
@@ -633,6 +970,68 @@ def create_map_deck(data, map_style='mapbox://styles/mapbox/satellite-v9'):
         api_keys={"mapbox": MAPBOX_API_KEY} if MAPBOX_API_KEY else None
     )
 
+
+def _map_signature(data: dict, map_style_name: str) -> tuple:
+    """Return a stable signature for when the *map visualization* should update.
+
+    Streamlit reruns re-execute the script; to avoid unnecessary PyDeck churn, we only
+    rebuild the Deck when map-relevant inputs change.
+    """
+    lat = data.get('lat')
+    lon = data.get('lon')
+    heading = data.get('heading_deg', 0)
+    wp_current = int(data.get('wp_current') or 0)
+    mission_pts = data.get('mission_points') or []
+    # Compress mission identity without hashing full arrays.
+    if mission_pts:
+        first = mission_pts[0]
+        last = mission_pts[-1]
+        try:
+            first_sig = (round(float(first[0]), 6), round(float(first[1]), 6))
+        except Exception:
+            first_sig = None
+        try:
+            last_sig = (round(float(last[0]), 6), round(float(last[1]), 6))
+        except Exception:
+            last_sig = None
+        mission_sig = (len(mission_pts), first_sig, last_sig)
+    else:
+        mission_sig = (0, None, None)
+
+    history = data.get('history') or []
+    if history:
+        try:
+            h_last = history[-1]
+            history_sig = (len(history), round(float(h_last[0]), 6), round(float(h_last[1]), 6))
+        except Exception:
+            history_sig = (len(history), None, None)
+    else:
+        history_sig = (0, None, None)
+
+    try:
+        lat_sig = None if lat is None else round(float(lat), 6)
+    except Exception:
+        lat_sig = None
+    try:
+        lon_sig = None if lon is None else round(float(lon), 6)
+    except Exception:
+        lon_sig = None
+
+    try:
+        heading_sig = round(float(heading or 0), 1)
+    except Exception:
+        heading_sig = 0
+
+    return (
+        map_style_name,
+        lat_sig,
+        lon_sig,
+        heading_sig,
+        wp_current,
+        mission_sig,
+        history_sig,
+    )
+
 # --- MAIN APP ---
 start_background_threads()
 # st_autorefresh removed in favor of while loop
@@ -645,6 +1044,10 @@ sidebar_sparkline_ph = st.sidebar.empty()
 sidebar_gps_ph = st.sidebar.empty()
 st.sidebar.divider()
 st.sidebar.subheader("Commands")
+
+# Mission transfer progress
+sidebar_mission_dl_ph = st.sidebar.empty()
+sidebar_mission_ul_ph = st.sidebar.empty()
 
 # Get connection from shared state
 cmd_conn = get_shared_state().get_connection()
@@ -725,9 +1128,10 @@ if st.sidebar.button("Skip WP", use_container_width=True, disabled=is_disabled):
 if st.sidebar.button("Fetch Mission", use_container_width=True, disabled=is_disabled):
     if cmd_conn:
         try:
-            with get_shared_state().acquire_mav_lock():
-                cmd_conn.mav.mission_request_list_send(cmd_conn.target_system, cmd_conn.target_component)
-            st.toast("Requesting Mission List...")
+            # Enqueue a mission fetch for the worker thread.
+            # Important: the worker owns conn.recv_match; avoid MAVFTP from UI thread.
+            get_shared_state().mission_fetch_queue.put({'ts': time.time()})
+            st.toast("Fetching mission...")
             st.rerun()
         except Exception as e:
             st.error(f"Failed to load map: {e}")
@@ -817,94 +1221,143 @@ if 'history' not in st.session_state:
 
 print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] Starting main update loop...")
 # --- Update Loop ---
+# Streamlit is rerun-driven; an infinite render loop can keep trying to push updates
+# after the browser disconnects, causing Tornado WebSocketClosedError spam.
 try:
-    while True:
-        current_data = get_shared_state().get()
+    current_data = get_shared_state().get()
 
-        # Auto-refresh if connection state changes to update UI buttons
-        if is_disabled and current_data.get('link_active'):
-            st.rerun()
-        elif not is_disabled and not current_data.get('link_active'):
-            st.rerun()
-        
-        # Update History (Breadcrumbs)
-        lat = current_data.get('lat')
-        lon = current_data.get('lon')
-        if lat and lon and lat != 0 and lon != 0:
-            history = st.session_state.history
-            if not history or (abs(history[-1][0] - lon) > 1e-7 or abs(history[-1][1] - lat) > 1e-7):
-                history.append([lon, lat])
-                if len(history) > 5000:
-                    history.pop(0)
-        
-        # Inject history into data for map creation
-        current_data['history'] = st.session_state.history
-    
-        # Sidebar Status
-        if current_data.get('link_active'):
-            sidebar_status_ph.markdown(f"✅ **ONLINE**<br><span style='font-size:0.8em; color:gray'>Last Update: {datetime.datetime.now().strftime('%H:%M:%S')}</span>", unsafe_allow_html=True)
+    # Adaptive refresh: rerun quickly when new data arrives, and back off when idle.
+    last_update_ts = float(current_data.get('last_update') or 0)
+    prev_update_ts = float(st.session_state.get('_last_seen_update_ts') or 0)
+    has_new_data = (last_update_ts != prev_update_ts)
+    st.session_state['_last_seen_update_ts'] = last_update_ts
+
+    # Auto-refresh if connection state changes to update UI buttons
+    if is_disabled and current_data.get('link_active'):
+        st.rerun()
+    elif not is_disabled and not current_data.get('link_active'):
+        st.rerun()
+
+    # Update History (Breadcrumbs)
+    lat = current_data.get('lat')
+    lon = current_data.get('lon')
+    if lat and lon and lat != 0 and lon != 0:
+        history = st.session_state.history
+        if not history or (abs(history[-1][0] - lon) > 1e-7 or abs(history[-1][1] - lat) > 1e-7):
+            history.append([lon, lat])
+            if len(history) > 5000:
+                history.pop(0)
+
+    # Inject history into data for map creation
+    current_data['history'] = st.session_state.history
+
+    # Sidebar Status
+    if current_data.get('link_active'):
+        sidebar_status_ph.markdown(f"✅ **ONLINE**<br><span style='font-size:0.8em; color:gray'>Last Update: {datetime.datetime.now().strftime('%H:%M:%S')}</span>", unsafe_allow_html=True)
+    else:
+        sidebar_status_ph.error("OFFLINE: Searching...")
+
+    # Sidebar GPS
+    lq = current_data.get('link_quality', 100)
+    lq_color = "#4caf50" if lq >= 90 else "#ff9800" if lq >= 70 else "#f44336"
+
+    # Mission transfer progress
+    dl_active = bool(current_data.get('mission_dl_active'))
+    dl_total = int(current_data.get('mission_dl_total') or 0)
+    dl_recv = int(current_data.get('mission_dl_received') or 0)
+    dl_done_ts = float(current_data.get('mission_dl_done_ts') or 0)
+    if dl_active:
+        if dl_total > 0:
+            sidebar_mission_dl_ph.progress(min(1.0, dl_recv / dl_total), text=f"Mission download {dl_recv}/{dl_total}")
         else:
-            sidebar_status_ph.error("OFFLINE: Searching...")
-    
-        # Sidebar GPS
-        lq = current_data.get('link_quality', 100)
-        lq_color = "#4caf50" if lq >= 90 else "#ff9800" if lq >= 70 else "#f44336"
-        
-        # Render Sparkline
-        lq_hist = current_data.get('link_quality_history', [])
-        sparkline_svg = generate_sparkline(lq_hist, color=lq_color)
-        sidebar_sparkline_ph.markdown(sparkline_svg, unsafe_allow_html=True)
-    
-        gps_html = f"""
-    <div style="line-height: 1.2; font-size: 0.9rem;">
-        <b>Link Quality:</b> <span style="color:{lq_color}; font-weight:bold;">{lq}%</span><br>
-        <hr style="margin: 5px 0; border-color: #333;">
-        <b>GPS 1:</b> {current_data.get('gps1_fix')}<br>
-        Lat: {current_data.get('lat') or 'N/A'}<br>
-        Lon: {current_data.get('lon') or 'N/A'}<br>
-        Sats: {current_data.get('satellites_visible')}
-    </div>
-    """
-        if current_data.get('gps2_fix'):
-            gps_html += f"""
-    <hr>
-    <div style="line-height: 1.2; font-size: 0.9rem;">
-        <b>GPS 2:</b> {current_data.get('gps2_fix')}<br>
-        Lat: {current_data.get('gps2_lat') or 'N/A'}<br>
-        Lon: {current_data.get('gps2_lon') or 'N/A'}<br>
-        Sats: {current_data.get('gps2_satellites_visible')}
-    </div>
-    """
-        sidebar_gps_ph.markdown(gps_html, unsafe_allow_html=True)
-    
-        # Metrics
-        metric_mode.metric("Mode", current_data.get('mode'))
-        metric_armed.metric("Armed", "ARMED" if current_data.get('armed') else "DISARMED")
-        metric_speed.metric("Speed", f"{current_data.get('speed_ms')} m/s")
-        metric_gps.metric("GPS", current_data.get('gps1_fix'))
-        metric_battery.metric("Battery", f"{current_data.get('battery_v')}V")
-        metric_wp.metric("WP", f"{current_data.get('wp_current', 0)}")
-    
-        # Map
+            sidebar_mission_dl_ph.markdown("**Mission download:** waiting for count…")
+    else:
+        if dl_total > 0 and (time.time() - dl_done_ts) <= MISSION_PROGRESS_GRACE_S:
+            sidebar_mission_dl_ph.progress(1.0, text=f"Mission download done {dl_recv}/{dl_total}")
+        else:
+            sidebar_mission_dl_ph.empty()
+
+    ul_active = bool(current_data.get('mission_ul_active'))
+    ul_total = int(current_data.get('mission_ul_total') or 0)
+    ul_sent = int(current_data.get('mission_ul_sent') or 0)
+    ul_done_ts = float(current_data.get('mission_ul_done_ts') or 0)
+    if ul_active:
+        if ul_total > 0:
+            sidebar_mission_ul_ph.progress(min(1.0, ul_sent / ul_total), text=f"Mission upload {ul_sent}/{ul_total}")
+        else:
+            sidebar_mission_ul_ph.markdown("**Mission upload:** starting…")
+    else:
+        if ul_total > 0 and (time.time() - ul_done_ts) <= MISSION_PROGRESS_GRACE_S:
+            sidebar_mission_ul_ph.progress(1.0, text=f"Mission upload done {ul_sent}/{ul_total}")
+        else:
+            sidebar_mission_ul_ph.empty()
+
+    # Render Sparkline
+    lq_hist = current_data.get('link_quality_history', [])
+    sparkline_svg = generate_sparkline(lq_hist, color=lq_color)
+    sidebar_sparkline_ph.markdown(sparkline_svg, unsafe_allow_html=True)
+
+    gps_html = f"""
+<div style="line-height: 1.2; font-size: 0.9rem;">
+    <b>Link Quality:</b> <span style="color:{lq_color}; font-weight:bold;">{lq}%</span><br>
+    <hr style="margin: 5px 0; border-color: #333;">
+    <b>GPS 1:</b> {current_data.get('gps1_fix')}<br>
+    Lat: {current_data.get('lat') or 'N/A'}<br>
+    Lon: {current_data.get('lon') or 'N/A'}<br>
+    Sats: {current_data.get('satellites_visible')}
+</div>
+"""
+    if current_data.get('gps2_fix'):
+        gps_html += f"""
+<hr>
+<div style="line-height: 1.2; font-size: 0.9rem;">
+    <b>GPS 2:</b> {current_data.get('gps2_fix')}<br>
+    Lat: {current_data.get('gps2_lat') or 'N/A'}<br>
+    Lon: {current_data.get('gps2_lon') or 'N/A'}<br>
+    Sats: {current_data.get('gps2_satellites_visible')}
+</div>
+"""
+    sidebar_gps_ph.markdown(gps_html, unsafe_allow_html=True)
+
+    # Metrics
+    metric_mode.metric("Mode", current_data.get('mode'))
+    metric_armed.metric("Armed", "ARMED" if current_data.get('armed') else "DISARMED")
+    metric_speed.metric("Speed", f"{current_data.get('speed_ms')} m/s")
+    metric_gps.metric("GPS", current_data.get('gps1_fix'))
+    metric_battery.metric("Battery", f"{current_data.get('battery_v')}V")
+    metric_wp.metric("WP", f"{current_data.get('wp_current', 0)}")
+
+    # Map
+    map_sig = _map_signature(current_data, map_style_name)
+    last_map_sig = st.session_state.get('_last_map_sig')
+    if (last_map_sig != map_sig) or ('_last_map_deck' not in st.session_state):
         deck = create_map_deck(current_data, selected_map_style)
-        if deck:
-            # Use a stable key that only changes when the style changes
-            # This prevents the map from reloading tiles every second
-            map_key = f"map_{map_style_name}"
-            map_placeholder.pydeck_chart(deck, key=map_key, width="stretch")
-        else:
-            map_placeholder.info("🛰️ Waiting for GPS Position...")
-    
-        # Console
-        msg_log = "<br>".join(current_data.get('messages', []))
-        console_placeholder.markdown(f"""
-            <div style="height:200px; overflow-y:auto; background-color:#0e1117; border:1px solid #30363d; padding:10px; color:#58a6ff; font-family:monospace; font-size:0.8rem;">
-                {msg_log}
-            </div>
-        """, unsafe_allow_html=True)
-    
-        time.sleep(1)
-    
+        st.session_state['_last_map_deck'] = deck
+        st.session_state['_last_map_sig'] = map_sig
+    else:
+        deck = st.session_state.get('_last_map_deck')
+
+    if deck:
+        # Keep a constant key to avoid remounting the map component.
+        map_placeholder.pydeck_chart(deck, key="map_chart", width="stretch")
+    else:
+        map_placeholder.info("🛰️ Waiting for GPS Position...")
+
+    # Console
+    msg_log = "<br>".join(current_data.get('messages', []))
+    console_placeholder.markdown(f"""
+        <div style="height:200px; overflow-y:auto; background-color:#0e1117; border:1px solid #30363d; padding:10px; color:#58a6ff; font-family:monospace; font-size:0.8rem;">
+            {msg_log}
+        </div>
+    """, unsafe_allow_html=True)
+
+    # Refresh cadence
+    #  - When data is flowing: refresh at ~1Hz
+    #  - When idle (no state changes): back off to reduce UI churn
+    refresh_s = 1 if has_new_data else 5
+    time.sleep(refresh_s)
+    st.rerun()
+
 except Exception as e:
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] Main loop stopped: {e}")
 except KeyboardInterrupt:

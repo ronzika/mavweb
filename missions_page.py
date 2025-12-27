@@ -9,6 +9,7 @@ import pydeck as pdk
 from missions import list_missions, parse_waypoints_file
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 import mavlink_utils
+from shared_state import get_shared_state
 
 
 #def render():
@@ -81,11 +82,48 @@ if len(missions) > 0:
 				st.subheader(f"Preview: {full_row['Mission']} ({full_row['Filename']})")
 			with col2:
 				if st.button("Load to Flight Controller", key=f"load_{full_row['Filename']}"):
-					success = mavlink_utils.upload_mission_to_fc(full_row['Path'])
-					if success:
-						st.success("Mission uploaded to flight controller!")
+					mission_items = mavlink_utils.parse_mission_file(full_row['Path'])
+					if mission_items:
+						state = get_shared_state()
+						grace_s = float(os.getenv("MISSION_PROGRESS_GRACE_S", "3") or 3)
+						state.set_upload_status('pending', 'Queued for upload...')
+						state.update({'mission_ul_active': False, 'mission_ul_total': 0, 'mission_ul_sent': 0, 'mission_ul_done_ts': 0.0})
+						state.upload_queue.put(mission_items)
+						import time
+						progress_ph = st.empty()
+						status_ph = st.empty()
+						start_time = time.time()
+						final_status = None
+						while time.time() - start_time < 60:
+							data = state.get()
+							ul_total = int(data.get('mission_ul_total') or len(mission_items) or 0)
+							ul_sent = int(data.get('mission_ul_sent') or 0)
+							if ul_total > 0:
+								progress_ph.progress(min(1.0, ul_sent / ul_total), text=f"Uploading {ul_sent}/{ul_total}")
+							else:
+								progress_ph.progress(0.0, text="Uploading...")
+
+							status = state.get_upload_status()
+							if status['status'] == 'success':
+								progress_ph.progress(1.0, text=f"Upload done {ul_total}/{ul_total}")
+								status_ph.success(status['message'])
+								final_status = 'success'
+								break
+							elif status['status'] == 'error':
+								status_ph.error(status['message'])
+								final_status = 'error'
+								break
+							time.sleep(0.2)
+						else:
+							status_ph.error("Upload timed out.")
+							final_status = 'timeout'
+
+						if final_status in ('success', 'error'):
+							time.sleep(grace_s)
+							progress_ph.empty()
+							status_ph.empty()
 					else:
-						st.error("Failed to upload mission.")
+						st.error("Failed to parse mission file.")
 			points = parse_waypoints_file(full_row['Path'])
 			if points:
 				path_points = [[p['lon'], p['lat']] for p in points]

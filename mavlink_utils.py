@@ -8,6 +8,7 @@ import base64
 from typing import Any
 from pymavlink import mavutil
 from dotenv import load_dotenv
+import mavsdk_mission
 
 load_dotenv()
 
@@ -42,7 +43,7 @@ def parse_mission_file(filepath: str):
         print(f"[MAVLINK] Error parsing mission file: {e}")
         return None
 
-def upload_mission(master, mission_items):
+def upload_mission(master, mission_items, progress_cb=None):
     try:
         print("[MAVLINK] Clearing existing mission...")
         master.mav.mission_clear_all_send(master.target_system, master.target_component)
@@ -54,8 +55,15 @@ def upload_mission(master, mission_items):
         
         print(f"[MAVLINK] Sending {len(mission_items)} mission items...")
         master.mav.mission_count_send(master.target_system, master.target_component, len(mission_items))
+
+        if progress_cb:
+            try:
+                progress_cb(0, len(mission_items))
+            except Exception:
+                pass
         
         last_req_seq = -1
+        sent_seqs = set()
         
         while True:
             # Wait for REQUEST or ACK
@@ -100,21 +108,40 @@ def upload_mission(master, mission_items):
                 int(item['y'] * 1e7), # Lon
                 float(item['z'])      # Alt
             )
-            
+
             if seq != last_req_seq:
                 print(f"[MAVLINK] Sent mission item {seq}")
                 last_req_seq = seq
+
+            if seq not in sent_seqs:
+                sent_seqs.add(seq)
+                if progress_cb:
+                    try:
+                        progress_cb(len(sent_seqs), len(mission_items))
+                    except Exception:
+                        pass
 
     except Exception as e:
         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Mission upload failed: {e}\n{traceback.format_exc()}")
         return False
 
 def upload_mission_to_fc(filepath: str) -> bool:
+    # Prefer MAVSDK Mission plugin (requested), with pymavlink fallback.
+    mavsdk_addr = (os.getenv("MAVSDK_SYSTEM_ADDRESS", "") or "udp://:14540").strip()
+    try:
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVSDK] Uploading mission via {mavsdk_addr}")
+        ok = mavsdk_mission.upload_qgc_wpl_mission_sync(filepath, mavsdk_addr, timeout_s=10.0)
+        if ok:
+            return True
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVSDK] Upload returned no points/failed; falling back")
+    except Exception as e:
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVSDK] Upload failed: {e}. Falling back to pymavlink.")
+
     endpoint = os.getenv("MAVLINK_ENDPOINT", "udpin:0.0.0.0:14550")
     mission_items = parse_mission_file(filepath)
     if not mission_items:
         return False
-        
+
     try:
         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Connecting to {endpoint}")
         master = mavutil.mavlink_connection(endpoint)

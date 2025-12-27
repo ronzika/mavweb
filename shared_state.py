@@ -28,12 +28,23 @@ class SharedState:
             'link_quality': 100,
             'link_quality_history': [],
             'packets_received': 0,
-            'packets_lost': 0
+            'packets_lost': 0,
+
+            # Mission transfer progress (batch operation UX)
+            'mission_dl_active': False,
+            'mission_dl_total': 0,
+            'mission_dl_received': 0,
+            'mission_dl_done_ts': 0.0,
+            'mission_ul_active': False,
+            'mission_ul_total': 0,
+            'mission_ul_sent': 0,
+            'mission_ul_done_ts': 0.0,
         }
         self.lock = threading.Lock()
         self.mav_lock = threading.Lock()
         self.connection = None
         self.upload_queue = queue.Queue()
+        self.mission_fetch_queue = queue.Queue()
         self.upload_status = {'status': 'idle', 'message': ''}
         self.current_worker_id = None
 
