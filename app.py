@@ -1038,16 +1038,9 @@ start_background_threads()
 
 # Sidebar Placeholders
 st.sidebar.title("🎮 Rover Control")
-sidebar_status_ph = st.sidebar.empty()
 st.sidebar.divider()
-sidebar_sparkline_ph = st.sidebar.empty()
-sidebar_gps_ph = st.sidebar.empty()
 st.sidebar.divider()
 st.sidebar.subheader("Commands")
-
-# Mission transfer progress
-sidebar_mission_dl_ph = st.sidebar.empty()
-sidebar_mission_ul_ph = st.sidebar.empty()
 
 # Get connection from shared state
 cmd_conn = get_shared_state().get_connection()
@@ -1220,46 +1213,49 @@ if 'history' not in st.session_state:
     st.session_state.history = []
 
 print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] Starting main update loop...")
-# --- Update Loop ---
-# Streamlit is rerun-driven; an infinite render loop can keep trying to push updates
-# after the browser disconnects, causing Tornado WebSocketClosedError spam.
-try:
+# --- Live UI (no full-page rerun loop) ---
+#
+# Using st.fragment lets Streamlit re-run ONLY this section on a timer.
+# That avoids full-page flicker and reduces map remount/redraw.
+@st.fragment(run_every=0.5)
+def _render_live_metrics():
+    current_data = get_shared_state().get()
+    metric_mode.metric("Mode", current_data.get('mode'))
+    metric_armed.metric("Armed", "ARMED" if current_data.get('armed') else "DISARMED")
+    metric_speed.metric("Speed", f"{current_data.get('speed_ms')} m/s")
+    metric_gps.metric("GPS", current_data.get('gps1_fix'))
+    metric_battery.metric("Battery", f"{current_data.get('battery_v')}V")
+    metric_wp.metric("WP", f"{current_data.get('wp_current', 0)}")
+
+
+@st.fragment(run_every=0.5)
+def _render_live_sidebar():
     current_data = get_shared_state().get()
 
-    # Adaptive refresh: rerun quickly when new data arrives, and back off when idle.
-    last_update_ts = float(current_data.get('last_update') or 0)
-    prev_update_ts = float(st.session_state.get('_last_seen_update_ts') or 0)
-    has_new_data = (last_update_ts != prev_update_ts)
-    st.session_state['_last_seen_update_ts'] = last_update_ts
+    now_ts = time.time()
+    last_ts = float(current_data.get('last_update') or 0)
+    age_s = (now_ts - last_ts) if last_ts else 999.0
 
-    # Auto-refresh if connection state changes to update UI buttons
-    if is_disabled and current_data.get('link_active'):
-        st.rerun()
-    elif not is_disabled and not current_data.get('link_active'):
-        st.rerun()
+    # IMPORTANT: This fragment must be invoked inside `with st.sidebar:`.
+    # Do NOT use `st.sidebar.*` or sidebar placeholders here.
 
-    # Update History (Breadcrumbs)
-    lat = current_data.get('lat')
-    lon = current_data.get('lon')
-    if lat and lon and lat != 0 and lon != 0:
-        history = st.session_state.history
-        if not history or (abs(history[-1][0] - lon) > 1e-7 or abs(history[-1][1] - lat) > 1e-7):
-            history.append([lon, lat])
-            if len(history) > 5000:
-                history.pop(0)
-
-    # Inject history into data for map creation
-    current_data['history'] = st.session_state.history
-
-    # Sidebar Status
+    # Status
     if current_data.get('link_active'):
-        sidebar_status_ph.markdown(f"✅ **ONLINE**<br><span style='font-size:0.8em; color:gray'>Last Update: {datetime.datetime.now().strftime('%H:%M:%S')}</span>", unsafe_allow_html=True)
+        dbg_line = ""
+        if DEBUG:
+            dbg_line = f"<br><span style='font-size:0.75em; color:gray'>age={age_s:.1f}s</span>"
+        st.markdown(
+            f"✅ **ONLINE**{dbg_line}<br><span style='font-size:0.8em; color:gray'>Last Update: {datetime.datetime.now().strftime('%H:%M:%S')}</span>",
+            unsafe_allow_html=True,
+        )
     else:
-        sidebar_status_ph.error("OFFLINE: Searching...")
-
-    # Sidebar GPS
-    lq = current_data.get('link_quality', 100)
-    lq_color = "#4caf50" if lq >= 90 else "#ff9800" if lq >= 70 else "#f44336"
+        if DEBUG:
+            st.markdown(
+                f"⚠️ **OFFLINE**<br><span style='font-size:0.75em; color:gray'>age={age_s:.1f}s</span>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.error("OFFLINE: Searching...")
 
     # Mission transfer progress
     dl_active = bool(current_data.get('mission_dl_active'))
@@ -1268,14 +1264,12 @@ try:
     dl_done_ts = float(current_data.get('mission_dl_done_ts') or 0)
     if dl_active:
         if dl_total > 0:
-            sidebar_mission_dl_ph.progress(min(1.0, dl_recv / dl_total), text=f"Mission download {dl_recv}/{dl_total}")
+            st.progress(min(1.0, dl_recv / dl_total), text=f"Mission download {dl_recv}/{dl_total}")
         else:
-            sidebar_mission_dl_ph.markdown("**Mission download:** waiting for count…")
+            st.progress(0.0, text="Mission download: waiting for count…")
     else:
         if dl_total > 0 and (time.time() - dl_done_ts) <= MISSION_PROGRESS_GRACE_S:
-            sidebar_mission_dl_ph.progress(1.0, text=f"Mission download done {dl_recv}/{dl_total}")
-        else:
-            sidebar_mission_dl_ph.empty()
+            st.progress(1.0, text=f"Mission download done {dl_recv}/{dl_total}")
 
     ul_active = bool(current_data.get('mission_ul_active'))
     ul_total = int(current_data.get('mission_ul_total') or 0)
@@ -1283,19 +1277,19 @@ try:
     ul_done_ts = float(current_data.get('mission_ul_done_ts') or 0)
     if ul_active:
         if ul_total > 0:
-            sidebar_mission_ul_ph.progress(min(1.0, ul_sent / ul_total), text=f"Mission upload {ul_sent}/{ul_total}")
+            st.progress(min(1.0, ul_sent / ul_total), text=f"Mission upload {ul_sent}/{ul_total}")
         else:
-            sidebar_mission_ul_ph.markdown("**Mission upload:** starting…")
+            st.markdown("**Mission upload:** starting…")
     else:
         if ul_total > 0 and (time.time() - ul_done_ts) <= MISSION_PROGRESS_GRACE_S:
-            sidebar_mission_ul_ph.progress(1.0, text=f"Mission upload done {ul_sent}/{ul_total}")
-        else:
-            sidebar_mission_ul_ph.empty()
+            st.progress(1.0, text=f"Mission upload done {ul_sent}/{ul_total}")
 
-    # Render Sparkline
+    # Link quality + GPS blocks
+    lq = current_data.get('link_quality', 100)
+    lq_color = "#4caf50" if lq >= 90 else "#ff9800" if lq >= 70 else "#f44336"
     lq_hist = current_data.get('link_quality_history', [])
     sparkline_svg = generate_sparkline(lq_hist, color=lq_color)
-    sidebar_sparkline_ph.markdown(sparkline_svg, unsafe_allow_html=True)
+    st.markdown(sparkline_svg, unsafe_allow_html=True)
 
     gps_html = f"""
 <div style="line-height: 1.2; font-size: 0.9rem;">
@@ -1317,17 +1311,14 @@ try:
     Sats: {current_data.get('gps2_satellites_visible')}
 </div>
 """
-    sidebar_gps_ph.markdown(gps_html, unsafe_allow_html=True)
+    st.markdown(gps_html, unsafe_allow_html=True)
 
-    # Metrics
-    metric_mode.metric("Mode", current_data.get('mode'))
-    metric_armed.metric("Armed", "ARMED" if current_data.get('armed') else "DISARMED")
-    metric_speed.metric("Speed", f"{current_data.get('speed_ms')} m/s")
-    metric_gps.metric("GPS", current_data.get('gps1_fix'))
-    metric_battery.metric("Battery", f"{current_data.get('battery_v')}V")
-    metric_wp.metric("WP", f"{current_data.get('wp_current', 0)}")
 
-    # Map
+@st.fragment(run_every=1.5)
+def _render_live_map():
+    current_data = get_shared_state().get()
+
+    # Map (cache deck unless signature changes)
     map_sig = _map_signature(current_data, map_style_name)
     last_map_sig = st.session_state.get('_last_map_sig')
     if (last_map_sig != map_sig) or ('_last_map_deck' not in st.session_state):
@@ -1338,27 +1329,34 @@ try:
         deck = st.session_state.get('_last_map_deck')
 
     if deck:
-        # Keep a constant key to avoid remounting the map component.
         map_placeholder.pydeck_chart(deck, key="map_chart", width="stretch")
     else:
         map_placeholder.info("🛰️ Waiting for GPS Position...")
 
-    # Console
+
+@st.fragment(run_every=0.8)
+def _render_live_console():
+    current_data = get_shared_state().get()
     msg_log = "<br>".join(current_data.get('messages', []))
-    console_placeholder.markdown(f"""
+    console_placeholder.markdown(
+        f"""
         <div style="height:200px; overflow-y:auto; background-color:#0e1117; border:1px solid #30363d; padding:10px; color:#58a6ff; font-family:monospace; font-size:0.8rem;">
             {msg_log}
         </div>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
-    # Refresh cadence
-    #  - When data is flowing: refresh at ~1Hz
-    #  - When idle (no state changes): back off to reduce UI churn
-    refresh_s = 1 if has_new_data else 5
-    time.sleep(refresh_s)
-    st.rerun()
 
+try:
+    _render_live_metrics()
+    _render_live_map()
+    _render_live_console()
+    # Streamlit doesn't allow writing to the sidebar from a fragment unless the
+    # fragment is invoked within a `with st.sidebar:` block.
+    with st.sidebar:
+        _render_live_sidebar()
 except Exception as e:
-    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] Main loop stopped: {e}")
-except KeyboardInterrupt:
-    pass
+    # Avoid killing the whole app if the live fragment hits a transient error.
+    if DEBUG:
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] Live UI error: {e}")
