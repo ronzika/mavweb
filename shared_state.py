@@ -23,6 +23,9 @@ class SharedState:
             'battery_pct': 0,
             'messages': [],
             'mission_points': [],
+            # Latest mission index reported by the vehicle (may jump to 0 on disarm/stop).
+            'wp_current_raw': 0,
+            # Waypoint index shown in UI (can intentionally ignore raw resets to 0).
             'wp_current': 0,
             # True once we have received a real waypoint index from the vehicle.
             # Used to disable UI actions that depend on a known current waypoint.
@@ -76,7 +79,10 @@ class SharedState:
     def update(self, data):
         with self.lock:
             self.rover_data.update(data)
-            if 'wp_current' in data and data.get('wp_current') is not None:
+            if (
+                ('wp_current' in data and data.get('wp_current') is not None)
+                or ('wp_current_raw' in data and data.get('wp_current_raw') is not None)
+            ):
                 self.rover_data['wp_current_known'] = True
             self.rover_data['last_update'] = time.time()
 

@@ -211,6 +211,49 @@ def _render_sidebar_controls():
             except Exception as e:
                 st.error(f"Failed to disarm: {e}")
 
+    # Reset Mission: set current mission item to 0 (disabled while in AUTO)
+    state_snapshot = get_shared_state().get()
+    current_mode = str(state_snapshot.get('mode') or '')
+    reset_disabled = is_disabled or (current_mode == 'AUTO')
+
+    if "confirm_reset_mission" not in st.session_state:
+        st.session_state["confirm_reset_mission"] = False
+
+    if st.button("Reset Mission", use_container_width=True, disabled=reset_disabled, key="cmd_reset_mission"):
+        st.session_state["confirm_reset_mission"] = True
+
+    if st.session_state.get("confirm_reset_mission", False):
+        st.warning("Are you sure?")
+
+        col_confirm, col_cancel = st.columns(2)
+        with col_confirm:
+            if st.button(
+                "Yes",
+                use_container_width=True,
+                disabled=reset_disabled,
+                key="cmd_reset_mission_confirm",
+            ):
+                if cmd_conn:
+                    try:
+                        with get_shared_state().acquire_mav_lock():
+                            cmd_conn.mav.mission_set_current_send(
+                                cmd_conn.target_system,
+                                cmd_conn.target_component,
+                                0,
+                            )
+                        get_shared_state().append_message("[UI] Reset mission to WP 0")
+                    except Exception as e:
+                        get_shared_state().append_message(f"[UI] Failed to reset mission: {e}")
+                st.session_state["confirm_reset_mission"] = False
+
+        with col_cancel:
+            if st.button(
+                "Cancel",
+                use_container_width=True,
+                key="cmd_reset_mission_cancel",
+            ):
+                st.session_state["confirm_reset_mission"] = False
+
     state_snapshot = get_shared_state().get()
     wp_known = bool(state_snapshot.get('wp_current_known', False))
     wp_current = int(state_snapshot.get('wp_current') or 0)
@@ -755,7 +798,27 @@ def mavlink_worker(endpoint, state):
                     data['satellites_visible'] = msg.satellites_visible
 
                 elif mtype == 'MISSION_CURRENT':
-                    data['wp_current'] = msg.seq
+                    seq = int(getattr(msg, 'seq', 0) or 0)
+                    data['wp_current_raw'] = seq
+
+                    # Keep UI WP stable across disarm/stop: some vehicles report seq=0 when not running.
+                    # Only let the UI reset to 0 when we believe the mission has restarted.
+                    try:
+                        snap = state.get()
+                    except Exception:
+                        snap = {}
+                    prev_known = bool(snap.get('wp_current_known', False))
+                    prev_mode = str(snap.get('mode') or '')
+                    prev_armed = bool(snap.get('armed', False))
+
+                    if seq > 0:
+                        data['wp_current'] = seq
+                    elif not prev_known:
+                        # First ever report can legitimately be 0.
+                        data['wp_current'] = 0
+                    elif prev_armed and prev_mode == 'AUTO':
+                        # Treat as mission restart.
+                        data['wp_current'] = 0
 
                 elif mtype == 'GPS2_RAW':
                     if msg.lat != 0 and msg.lon != 0:
@@ -776,15 +839,15 @@ def mavlink_worker(endpoint, state):
                     state.append_message(txt)
                     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [STATUSTEXT] setting {txt}")
                     
-                    # Auto-reset mission when complete
-                    if "Mission Complete" in txt:
-                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Mission Complete detected. Resetting WP to 0.")
-                        try:
-                            with state.acquire_mav_lock():
-                                conn.mav.mission_set_current_send(conn.target_system, conn.target_component, 0)
-                            state.append_message("Mission Reset to WP 0")
-                        except Exception as e:
-                            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Failed to reset mission: {e}")
+                    # # Auto-reset mission when complete
+                    # if "Mission Complete" in txt:
+                    #     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Mission Complete detected. Resetting WP to 0.")
+                    #     try:
+                    #         with state.acquire_mav_lock():
+                    #             conn.mav.mission_set_current_send(conn.target_system, conn.target_component, 0)
+                    #         state.append_message("Mission Reset to WP 0")
+                    #     except Exception as e:
+                    #         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Failed to reset mission: {e}")
 
                     # Parse "Mission: #" messages (ArduPilot)
                     # Also handle "Reached command #"
@@ -805,8 +868,22 @@ def mavlink_worker(endpoint, state):
                             pass
                             
                     if wp_num >= 0:
-                        data['wp_current'] = wp_num
-                        state.update({'wp_current': wp_num})
+                        data['wp_current_raw'] = int(wp_num)
+                        # Apply the same "stable display" rule as MISSION_CURRENT.
+                        try:
+                            snap = state.get()
+                        except Exception:
+                            snap = {}
+                        prev_known = bool(snap.get('wp_current_known', False))
+                        prev_mode = str(snap.get('mode') or '')
+                        prev_armed = bool(snap.get('armed', False))
+
+                        if wp_num > 0:
+                            data['wp_current'] = int(wp_num)
+                        elif not prev_known:
+                            data['wp_current'] = 0
+                        elif prev_armed and prev_mode == 'AUTO':
+                            data['wp_current'] = 0
 
                 elif mtype == 'MISSION_ACK':
                     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK {threading.get_ident()}] Mission Ack: {msg.type} from {msg.get_srcSystem()}:{msg.get_srcComponent()}")
