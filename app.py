@@ -62,13 +62,24 @@ def get_gps_fix_string(fix_type):
 def request_message_interval(conn, msg_id, hz):
     try:
         interval_us = int(1_000_000 / hz)
+        set_message_interval_us(conn, msg_id, interval_us)
+    except Exception:
+        pass
+
+
+def set_message_interval_us(conn, msg_id, interval_us: int):
+    """Set a MAVLink message interval in microseconds.
+
+    interval_us=0 disables the stream (vehicle dependent, but common behavior).
+    """
+    try:
         conn.mav.command_long_send(
             conn.target_system,
             conn.target_component,
             mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
             0,
-            msg_id,
-            interval_us,
+            int(msg_id),
+            int(interval_us),
             0,
             0,
             0,
@@ -77,6 +88,17 @@ def request_message_interval(conn, msg_id, hz):
         )
     except Exception:
         pass
+
+
+# Telemetry message intervals the worker requests on connect.
+TELEMETRY_MESSAGE_INTERVALS: list[tuple[int, float]] = [
+    (mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 2),
+    (mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT, 2),
+    (mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS, 1),
+    (mavutil.mavlink.MAVLINK_MSG_ID_MISSION_CURRENT, 2),
+    (mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD, 2),
+    (mavutil.mavlink.MAVLINK_MSG_ID_GPS2_RAW, 1),
+]
 
 
 def _parse_qgc_wpl_text_to_lonlat(text: str) -> list[list[float]]:
@@ -608,16 +630,38 @@ def mavlink_worker(endpoint, state):
             )
 
             # Request Specific Data Streams
-            for msg_id, hz in [
-                (mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 2),
-                (mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT, 2),
-                (mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS, 1),
-                (mavutil.mavlink.MAVLINK_MSG_ID_MISSION_CURRENT, 2),
-                (mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD, 2),
-                (mavutil.mavlink.MAVLINK_MSG_ID_GPS2_RAW, 1)
-            ]:
+            for msg_id, hz in TELEMETRY_MESSAGE_INTERVALS:
                 request_message_interval(conn, msg_id, hz)
 
+            def _set_upload_telemetry_throttle(enabled: bool):
+                """Reduce telemetry during mission uploads to prioritize MISSION_* traffic."""
+                try:
+                    if not enabled:
+                        # Best-effort: stop legacy stream requests.
+                        conn.mav.request_data_stream_send(
+                            conn.target_system,
+                            conn.target_component,
+                            mavutil.mavlink.MAV_DATA_STREAM_ALL,
+                            0,
+                            0,
+                        )
+                        # Disable the specific message intervals we request.
+                        for mid, _hz in TELEMETRY_MESSAGE_INTERVALS:
+                            set_message_interval_us(conn, mid, 0)
+                    else:
+                        # Restore defaults.
+                        conn.mav.request_data_stream_send(
+                            conn.target_system,
+                            conn.target_component,
+                            mavutil.mavlink.MAV_DATA_STREAM_ALL,
+                            2,
+                            1,
+
+                        )
+                        for mid, hz in TELEMETRY_MESSAGE_INTERVALS:
+                            request_message_interval(conn, mid, hz)
+                except Exception:
+                    pass
             last_heartbeat = 0
             while True:
                 # Check if superseded
@@ -704,8 +748,13 @@ def mavlink_worker(endpoint, state):
                             state.update({'mission_ul_active': True, 'mission_ul_total': int(total), 'mission_ul_sent': int(sent)})
                             state.set_upload_status('uploading', f'Uploading {sent}/{total}...')
 
-                        # Use the existing connection to upload
-                        success = upload_mission(conn, mission_items, progress_cb=_upload_progress)
+                        # Use the existing connection to upload.
+                        # Throttle telemetry to speed up MISSION_REQUEST/ITEM exchanges.
+                        _set_upload_telemetry_throttle(False)
+                        try:
+                            success = upload_mission(conn, mission_items, progress_cb=_upload_progress)
+                        finally:
+                            _set_upload_telemetry_throttle(True)
                         if success:
                             state.set_upload_status('success', 'Upload complete!')
                             state.update({'mission_ul_active': False, 'mission_ul_done_ts': time.time()})

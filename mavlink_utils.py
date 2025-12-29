@@ -5,6 +5,7 @@ import traceback
 import threading
 import socket
 import base64
+import math
 from typing import Any
 from pymavlink import mavutil
 from dotenv import load_dotenv
@@ -44,12 +45,54 @@ def parse_mission_file(filepath: str):
         return None
 
 def upload_mission(master, mission_items, progress_cb=None):
+    def _clamp_int32(n: int) -> int:
+        if n > 2147483647:
+            return 2147483647
+        if n < -2147483648:
+            return -2147483648
+        return n
+
+    def _safe_xy_int32(frame: int, x_val: float, y_val: float) -> tuple[int, int]:
+        """Return (x, y) as int32 suitable for MISSION_ITEM_INT.
+
+        For global frames where x/y look like degrees, convert lat/lon degrees to 1e7.
+        Otherwise, treat x/y as already-int-ish values and round to nearest integer.
+        Always clamps to signed int32 to avoid struct.pack overflow.
+        """
+        try:
+            xf = float(x_val)
+            yf = float(y_val)
+        except Exception:
+            return 0, 0
+
+        if not (math.isfinite(xf) and math.isfinite(yf)):
+            return 0, 0
+
+        global_frames = {
+            0,  # MAV_FRAME_GLOBAL
+            3,  # MAV_FRAME_GLOBAL_RELATIVE_ALT
+            5,  # MAV_FRAME_GLOBAL_INT
+            6,  # MAV_FRAME_GLOBAL_RELATIVE_ALT_INT
+            10, # MAV_FRAME_GLOBAL_TERRAIN_ALT
+            11, # MAV_FRAME_GLOBAL_TERRAIN_ALT_INT
+        }
+
+        if int(frame) in global_frames and abs(xf) <= 90.0 and abs(yf) <= 180.0:
+            xi = int(round(xf * 1e7))
+            yi = int(round(yf * 1e7))
+        else:
+            xi = int(round(xf))
+            yi = int(round(yf))
+
+        return _clamp_int32(xi), _clamp_int32(yi)
+
     try:
         print("[MAVLINK] Clearing existing mission...")
         master.mav.mission_clear_all_send(master.target_system, master.target_component)
         
         # Wait for ACK for clear
-        ack = master.recv_match(type='MISSION_ACK', blocking=True, timeout=3)
+        # Some vehicles may not ACK promptly; don't stall the whole upload.
+        ack = master.recv_match(type='MISSION_ACK', blocking=True, timeout=0.3)
         if ack:
             print(f"[MAVLINK] Clear ACK: {ack.type}")
         
@@ -90,13 +133,18 @@ def upload_mission(master, mission_items, progress_cb=None):
                 continue
                 
             item = mission_items[seq]
+
+            frame = int(item.get('frame', 0) or 0)
+            x_raw = item.get('x', 0.0)
+            y_raw = item.get('y', 0.0)
+            x_i, y_i = _safe_xy_int32(frame, x_raw, y_raw)
             
             # Use INT for precision and robustness
             master.mav.mission_item_int_send(
                 master.target_system,
                 master.target_component,
                 item['seq'],
-                item['frame'],
+                frame,
                 item['command'],
                 item['current'],
                 item['autocontinue'],
@@ -104,8 +152,8 @@ def upload_mission(master, mission_items, progress_cb=None):
                 item['param2'],
                 item['param3'],
                 item['param4'],
-                int(item['x'] * 1e7), # Lat
-                int(item['y'] * 1e7), # Lon
+                x_i,
+                y_i,
                 float(item['z'])      # Alt
             )
 
