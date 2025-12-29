@@ -24,6 +24,9 @@ class SharedState:
             'messages': [],
             'mission_points': [],
             'wp_current': 0,
+            # True once we have received a real waypoint index from the vehicle.
+            # Used to disable UI actions that depend on a known current waypoint.
+            'wp_current_known': False,
             'last_update': 0,
             'link_quality': 100,
             'link_quality_history': [],
@@ -39,6 +42,9 @@ class SharedState:
             'mission_ul_total': 0,
             'mission_ul_sent': 0,
             'mission_ul_done_ts': 0.0,
+
+            # Backwards-compat UI flag used by some pages/buttons.
+            'mission_loading': False,
         }
         self.lock = threading.Lock()
         self.mav_lock = threading.Lock()
@@ -70,6 +76,8 @@ class SharedState:
     def update(self, data):
         with self.lock:
             self.rover_data.update(data)
+            if 'wp_current' in data and data.get('wp_current') is not None:
+                self.rover_data['wp_current_known'] = True
             self.rover_data['last_update'] = time.time()
 
     def append_message(self, msg_text):
@@ -94,6 +102,20 @@ class SharedState:
     def get(self):
         with self.lock:
             return self.rover_data.copy()
+
+    # --- Backwards-compatible helpers ---
+    def set_loading(self, loading: bool):
+        """Compatibility shim for older UI code.
+
+        This does NOT drive mission download/upload logic; it's only a UI hint.
+        """
+        with self.lock:
+            self.rover_data['mission_loading'] = bool(loading)
+            self.rover_data['last_update'] = time.time()
+
+    def is_loading(self) -> bool:
+        with self.lock:
+            return bool(self.rover_data.get('mission_loading', False))
 
 @st.cache_resource
 def get_shared_state():

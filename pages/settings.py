@@ -5,7 +5,7 @@ import streamlit as st
 from pathlib import Path
 import config
 
-def load_env_example():
+def load_env_vars():
 	env_path = Path(__file__).parent / '.env'
 	env_vars = {}
 	if env_path.exists():
@@ -28,7 +28,7 @@ def save_env_vars(new_vars):
 
 st.title('Settings')
 st.info('Edit and save environment variables. Changes will be written to .env.')
-env_vars = load_env_example()
+env_vars = load_env_vars()
 current = {k: st.session_state.get(f'env_{k}', v) for k, v in env_vars.items()}
 with st.form('env_form'):
     new_vars = {}

@@ -17,13 +17,16 @@ import streamlit as st
 from dotenv import load_dotenv
 from pymavlink import mavutil
 from pymavlink import mavftp
+
 from shared_state import get_shared_state
 from mavlink_utils import upload_mission
 import mavsdk_mission
 
 # --- Configuration ---
 env_path = Path(__file__).parent / '.env'
-print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Loading .env from: {env_path} (Exists: {env_path.exists()})")
+print(
+    f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Loading .env from: {env_path} (Exists: {env_path.exists()})"
+)
 load_dotenv(dotenv_path=env_path, override=True)
 
 MAVLINK_ENDPOINT = os.getenv("MAVLINK_ENDPOINT", "udpin:0.0.0.0:14550")
@@ -32,13 +35,11 @@ DEBUG = os.getenv("DEBUG", "0") != "0"
 MAVSDK_SYSTEM_ADDRESS = (os.getenv("MAVSDK_SYSTEM_ADDRESS", "") or "udp://:14540").strip()
 
 # Mission transfer tuning (speed)
-# For maximum speed with a single port/connection, prefer the MAVLink mission protocol over the existing conn.
 MISSION_FETCH_METHOD = (os.getenv("MISSION_FETCH_METHOD", "mavlink") or "mavlink").strip().lower()
 MISSION_RETRY_INTERVAL_S = float(os.getenv("MISSION_RETRY_INTERVAL_S", "0.2") or 0.2)
 WORKER_RECV_TIMEOUT_S = float(os.getenv("WORKER_RECV_TIMEOUT_S", "0.1") or 0.1)
 MISSION_PROGRESS_GRACE_S = float(os.getenv("MISSION_PROGRESS_GRACE_S", "3") or 3)
 
-# Debug Mapbox Key
 if MAPBOX_API_KEY:
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Mapbox Key Loaded: {MAPBOX_API_KEY[:10]}...")
 else:
@@ -46,64 +47,33 @@ else:
 
 st.set_page_config(page_title="Rover GCS", layout="wide", initial_sidebar_state="expanded")
 
-# --- Settings Page ---
-def load_env_example():
-    env_path = Path(__file__).parent / '.env'
-    env_vars = {}
-    if env_path.exists():
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                match = re.match(r'([A-Za-z0-9_]+)=(.*)', line)
-                if match:
-                    key, value = match.groups()
-                    env_vars[key] = value
-    return env_vars
-
-def save_env_vars(new_vars):
-    env_path = Path(__file__).parent / '.env'
-    with open(env_path, 'w') as f:
-        for k, v in new_vars.items():
-            f.write(f'{k}={v}\n')
-
-def settings_page():
-    st.title('Settings')
-    st.info('Edit and save environment variables. Changes will be written to .env.')
-    env_vars = load_env_example()
-    current = {k: st.session_state.get(f'env_{k}', v) for k, v in env_vars.items()}
-    with st.form('env_form'):
-        new_vars = {}
-        for k, v in env_vars.items():
-            new_vars[k] = st.text_input(k, value=current[k], key=f'env_{k}')
-        submitted = st.form_submit_button('Save')
-        if submitted:
-            save_env_vars(new_vars)
-            st.session_state['Pages'] = 'Dashboard'
-            st.success('.env updated! Reloading app...')
-            st.rerun()
-
-
-
 
 # --- MAVLink Utilities ---
 def get_mode_name(custom_mode):
-    mapping = {0: 'MANUAL', 1: 'ACRO', 3: 'STEERING', 4: 'HOLD', 5: 'LOITER',
-               10: 'AUTO', 11: 'RTL', 15: 'GUIDED'}
+    mapping = {0: 'MANUAL', 1: 'ACRO', 3: 'STEERING', 4: 'HOLD', 5: 'LOITER', 10: 'AUTO', 11: 'RTL', 15: 'GUIDED'}
     return mapping.get(custom_mode, f"MODE({custom_mode})")
+
 
 def get_gps_fix_string(fix_type):
     mapping = {0: 'No GPS', 1: 'No Fix', 2: '2D Fix', 3: '3D Fix', 4: 'DGPS', 5: 'RTK Float', 6: 'RTK Fixed'}
     return mapping.get(fix_type, f"Fix({fix_type})")
 
+
 def request_message_interval(conn, msg_id, hz):
     try:
         interval_us = int(1_000_000 / hz)
         conn.mav.command_long_send(
-            conn.target_system, conn.target_component,
-            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
-            msg_id, interval_us, 0, 0, 0, 0, 0
+            conn.target_system,
+            conn.target_component,
+            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+            0,
+            msg_id,
+            interval_us,
+            0,
+            0,
+            0,
+            0,
+            0,
         )
     except Exception:
         pass
@@ -135,6 +105,163 @@ def _parse_qgc_wpl_text_to_lonlat(text: str) -> list[list[float]]:
         return points
     except Exception:
         return []
+
+
+# Map style options (used by sidebar fragment + map fragment)
+map_styles = {
+    "Satellite": "mapbox://styles/mapbox/satellite-v9",
+    "Satellite Streets": "mapbox://styles/mapbox/satellite-streets-v12",
+    "Streets": "mapbox://styles/mapbox/streets-v11",
+    "Dark": "mapbox://styles/mapbox/dark-v10",
+    "Light": "mapbox://styles/mapbox/light-v10",
+    "Outdoors": "mapbox://styles/mapbox/outdoors-v11",
+}
+map_options = list(map_styles.keys())
+
+if "map_style_ind" not in st.session_state:
+    st.session_state["map_style_ind"] = 3
+if "map_style_select_fixed" not in st.session_state:
+    st.session_state["map_style_select_fixed"] = map_options[st.session_state["map_style_ind"]]
+
+
+def update_map_style():
+    try:
+        st.session_state["map_style_ind"] = map_options.index(st.session_state["map_style_select_fixed"])
+    except Exception:
+        st.session_state["map_style_ind"] = 0
+
+
+@st.fragment(run_every=0.5)
+def _render_sidebar_controls():
+    """Render command buttons and map settings.
+
+    IMPORTANT: Call inside `with st.sidebar:`. Do not call `st.sidebar.*` here.
+    """
+    cmd_conn = get_shared_state().get_connection()
+    is_disabled = not cmd_conn
+
+    st.subheader("Commands")
+
+    if st.button("MANUAL", use_container_width=True, disabled=is_disabled, key="cmd_manual"):
+        if cmd_conn:
+            try:
+                with get_shared_state().acquire_mav_lock():
+                    cmd_conn.mav.set_mode_send(cmd_conn.target_system, 1, 0)
+                st.toast("Set Mode: MANUAL")
+            except Exception as e:
+                st.error(f"Failed to set mode: {e}")
+
+    if st.button("AUTO", use_container_width=True, disabled=is_disabled, key="cmd_auto"):
+        if cmd_conn:
+            try:
+                with get_shared_state().acquire_mav_lock():
+                    cmd_conn.mav.set_mode_send(cmd_conn.target_system, 1, 10)
+                st.toast("Set Mode: AUTO")
+            except Exception as e:
+                st.error(f"Failed to set mode: {e}")
+
+    if st.button("HOLD", use_container_width=True, disabled=is_disabled, key="cmd_hold"):
+        if cmd_conn:
+            try:
+                with get_shared_state().acquire_mav_lock():
+                    cmd_conn.mav.set_mode_send(cmd_conn.target_system, 1, 4)
+                st.toast("Set Mode: HOLD")
+            except Exception as e:
+                st.error(f"Failed to set mode: {e}")
+
+    if st.button("ARM", use_container_width=True, disabled=is_disabled, key="cmd_arm"):
+        if cmd_conn:
+            try:
+                with get_shared_state().acquire_mav_lock():
+                    cmd_conn.mav.command_long_send(
+                        cmd_conn.target_system,
+                        cmd_conn.target_component,
+                        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                        0,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                st.toast("Sent ARM Command")
+            except Exception as e:
+                st.error(f"Failed to arm: {e}")
+
+    if st.button("Disarm", use_container_width=True, disabled=is_disabled, key="cmd_disarm"):
+        if cmd_conn:
+            try:
+                with get_shared_state().acquire_mav_lock():
+                    cmd_conn.mav.command_long_send(
+                        cmd_conn.target_system,
+                        cmd_conn.target_component,
+                        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                st.toast("Sent DISARM Command")
+            except Exception as e:
+                st.error(f"Failed to disarm: {e}")
+
+    state_snapshot = get_shared_state().get()
+    wp_known = bool(state_snapshot.get('wp_current_known', False))
+    wp_current = int(state_snapshot.get('wp_current') or 0)
+    mission_total = int(state_snapshot.get('mission_dl_total') or 0)
+
+    skip_disabled = is_disabled or (not wp_known)
+    if st.button("Skip WP", use_container_width=True, disabled=skip_disabled, key="cmd_skip_wp"):
+        if cmd_conn and wp_known:
+            try:
+                target_wp = wp_current + 1
+                if mission_total > 0:
+                    target_wp = min(target_wp, mission_total - 1)
+
+                if mission_total > 0 and wp_current >= mission_total - 1:
+                    get_shared_state().append_message(f"[UI] Skip WP ignored: already at last WP ({wp_current}/{mission_total - 1}).")
+                else:
+                    with get_shared_state().acquire_mav_lock():
+                        cmd_conn.mav.mission_set_current_send(
+                            cmd_conn.target_system,
+                            cmd_conn.target_component,
+                            int(target_wp),
+                        )
+                    get_shared_state().append_message(f"[UI] Skipped from WP {wp_current} to WP {target_wp}.")
+            except Exception as e:
+                get_shared_state().append_message(f"[UI] Failed to skip waypoint: {e}")
+
+    if st.button("Fetch Mission", use_container_width=True, disabled=is_disabled, key="cmd_fetch_mission"):
+        if cmd_conn:
+            try:
+                get_shared_state().set_loading(True)
+                get_shared_state().mission_fetch_queue.put({'ts': time.time()})
+                get_shared_state().append_message("[UI] Requested mission list from vehicle.")
+            except Exception as e:
+                get_shared_state().set_loading(False)
+                get_shared_state().append_message(f"[UI] Failed to request mission: {e}")
+
+    st.divider()
+    st.subheader("Map Settings")
+    st.selectbox(
+        "Map Style",
+        map_options,
+        index=st.session_state["map_style_ind"],
+        disabled=False,
+        key="map_style_select_fixed",
+        on_change=update_map_style,
+    )
+
+    if is_disabled:
+        st.warning("Commands disabled: MAVLink connection not available.")
+    elif not wp_known:
+        st.info("Skip WP disabled: waiting for current waypoint (MISSION_CURRENT).")
 
 
 def _try_fetch_mission_via_mavftp(conn) -> list[list[float]]:
@@ -1036,131 +1163,7 @@ def _map_signature(data: dict, map_style_name: str) -> tuple:
 start_background_threads()
 # st_autorefresh removed in favor of while loop
 
-# Sidebar Placeholders
-st.sidebar.title("🎮 Rover Control")
-st.sidebar.divider()
-st.sidebar.divider()
-st.sidebar.subheader("Commands")
-
-# Get connection from shared state
-cmd_conn = get_shared_state().get_connection()
-
-# Disable buttons if not connected
-is_disabled = not cmd_conn
-
-if st.sidebar.button("MANUAL", use_container_width=True, disabled=is_disabled):
-    if cmd_conn:
-        try:
-            with get_shared_state().acquire_mav_lock():
-                cmd_conn.mav.set_mode_send(cmd_conn.target_system, 1, 0)
-            st.toast("Set Mode: MANUAL")
-        except Exception as e:
-            st.error(f"Failed to set mode: {e}")
-
-if st.sidebar.button("AUTO", use_container_width=True, disabled=is_disabled):
-    if cmd_conn:
-        try:
-            with get_shared_state().acquire_mav_lock():
-                cmd_conn.mav.set_mode_send(cmd_conn.target_system, 1, 10)
-            st.toast("Set Mode: AUTO")
-        except Exception as e:
-            st.error(f"Failed to set mode: {e}")
-
-if st.sidebar.button("HOLD", use_container_width=True, disabled=is_disabled):
-    if cmd_conn:
-        try:
-            with get_shared_state().acquire_mav_lock():
-                cmd_conn.mav.set_mode_send(cmd_conn.target_system, 1, 4)
-            st.toast("Set Mode: HOLD")
-        except Exception as e:
-            st.error(f"Failed to set mode: {e}")
-
-if st.sidebar.button("ARM", use_container_width=True, disabled=is_disabled):
-    if cmd_conn:
-        try:
-            with get_shared_state().acquire_mav_lock():
-                cmd_conn.mav.command_long_send(cmd_conn.target_system, cmd_conn.target_component, 
-                                          mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0)
-            st.toast("Sent ARM Command")
-        except Exception as e:
-            st.error(f"Failed to arm: {e}")
-
-if st.sidebar.button("Disarm", use_container_width=True, disabled=is_disabled):
-    if cmd_conn:
-        try:
-            with get_shared_state().acquire_mav_lock():
-                cmd_conn.mav.command_long_send(cmd_conn.target_system, cmd_conn.target_component, 
-                                          mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0)
-            st.toast("Sent DISARM Command")
-        except Exception as e:
-            st.error(f"Failed to disarm: {e}")
-
-if st.sidebar.button("Skip WP", use_container_width=True, disabled=is_disabled):
-    if cmd_conn:
-        try:
-            data = get_shared_state().get()
-            wp_current = data.get('wp_current', 0)
-            mission_pts = data.get('mission_points', [])
-            total_wp = len(mission_pts)
-            
-            if total_wp > 0:
-                next_wp = min(wp_current + 1, max(0, total_wp - 1))
-                with get_shared_state().acquire_mav_lock():
-                    cmd_conn.mav.mission_set_current_send(
-                        cmd_conn.target_system,
-                        cmd_conn.target_component,
-                        int(next_wp)
-                    )
-                st.toast(f"Skipped to WP {next_wp}")
-                get_shared_state().append_message(f"[UI] Skipped to WP {next_wp}")
-            else:
-                st.warning("No mission loaded.")
-        except Exception as e:
-            st.error(f"Failed to skip waypoint: {e}")
-
-if st.sidebar.button("Fetch Mission", use_container_width=True, disabled=is_disabled):
-    if cmd_conn:
-        try:
-            # Enqueue a mission fetch for the worker thread.
-            # Important: the worker owns conn.recv_match; avoid MAVFTP from UI thread.
-            get_shared_state().mission_fetch_queue.put({'ts': time.time()})
-            st.toast("Fetching mission...")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Failed to load map: {e}")
-
-st.sidebar.divider()
-st.sidebar.subheader("Map Settings")
-
-map_styles = {
-    "Satellite": "mapbox://styles/mapbox/satellite-v9",
-    "Satellite Streets": "mapbox://styles/mapbox/satellite-streets-v12",
-    "Streets": "mapbox://styles/mapbox/streets-v11",
-    "Dark": "mapbox://styles/mapbox/dark-v10",
-    "Light": "mapbox://styles/mapbox/light-v10",
-    "Outdoors": "mapbox://styles/mapbox/outdoors-v11"
-}
-map_options = list(map_styles.keys())
-
-# Initialize session state for map style index if not present
-if "map_style_ind" not in st.session_state:
-    st.session_state["map_style_ind"] = 3
-
-def update_map_style():
-    st.session_state["map_style_ind"] = map_options.index(st.session_state["map_style_select_fixed"])
-
-map_style_name = st.sidebar.selectbox(
-    "Map Style", 
-    map_options, 
-    index=st.session_state["map_style_ind"], 
-    disabled=False, 
-    key="map_style_select_fixed",
-    on_change=update_map_style
-)
-selected_map_style = map_styles[map_style_name]
-
-if is_disabled:
-    st.sidebar.warning("Commands disabled: MAVLink connection not available.")
+# NOTE: Sidebar UI is rendered via fragments later (see bottom of file).
 
 # Custom CSS for Metrics
 st.markdown("""
@@ -1245,7 +1248,7 @@ def _render_live_sidebar():
         if DEBUG:
             dbg_line = f"<br><span style='font-size:0.75em; color:gray'>age={age_s:.1f}s</span>"
         st.markdown(
-            f"✅ **ONLINE**{dbg_line}<br><span style='font-size:0.8em; color:gray'>Last Update: {datetime.datetime.now().strftime('%H:%M:%S')}</span>",
+            f"✅ **ROVER ONLINE**{dbg_line}<br><span style='font-size:0.8em; color:gray'>Last Update: {datetime.datetime.now().strftime('%H:%M:%S')}</span>",
             unsafe_allow_html=True,
         )
     else:
@@ -1318,6 +1321,13 @@ def _render_live_sidebar():
 def _render_live_map():
     current_data = get_shared_state().get()
 
+    # Map style comes from session_state (set by the sidebar controls fragment)
+    try:
+        map_style_name = st.session_state.get("map_style_select_fixed") or map_options[st.session_state.get("map_style_ind", 0)]
+    except Exception:
+        map_style_name = map_options[0]
+    selected_map_style = map_styles.get(map_style_name, list(map_styles.values())[0])
+
     # Map (cache deck unless signature changes)
     map_sig = _map_signature(current_data, map_style_name)
     last_map_sig = st.session_state.get('_last_map_sig')
@@ -1352,10 +1362,13 @@ try:
     _render_live_metrics()
     _render_live_map()
     _render_live_console()
-    # Streamlit doesn't allow writing to the sidebar from a fragment unless the
-    # fragment is invoked within a `with st.sidebar:` block.
+    # Sidebar: invoke fragments inside a sidebar context.
     with st.sidebar:
+        st.title("🎮 Rover Control")
+        st.divider()
         _render_live_sidebar()
+        st.divider()
+        _render_sidebar_controls()
 except Exception as e:
     # Avoid killing the whole app if the live fragment hits a transient error.
     if DEBUG:
