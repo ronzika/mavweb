@@ -80,6 +80,24 @@ if len(missions) > 0:
 			path = mission_row.iloc[0]['Path']
 			print(f"Uploading mission from {path}")
 			
+			# Publish mission points to shared state so the main map can render it immediately
+			# (without needing to fetch mission from the FC).
+			try:
+				pts = parse_waypoints_file(path)
+				if pts:
+					path_points = [[p['lon'], p['lat']] for p in pts]
+					state = get_shared_state()
+					import time
+					state.update({
+						'mission_points': path_points,
+						'mission_dl_total': len(path_points),
+						'mission_dl_received': len(path_points),
+						'mission_dl_active': False,
+						'mission_dl_done_ts': time.time(),
+					})
+			except Exception as e:
+				st.sidebar.warning(f"Mission preview update failed: {e}")
+			
 			mission_items = mavlink_utils.parse_mission_file(path)
 			if mission_items:
 				state = get_shared_state()
@@ -165,6 +183,24 @@ if len(missions) > 0:
 				st.subheader(f"Preview: {full_row['Mission']} ({full_row['Filename']})")
 			with col2:
 				if st.button("Load to Flight Controller", key=f"load_{full_row['Filename']}"):
+					# Publish mission points to shared state so the main map can render it immediately
+					# (without needing to fetch mission from the FC).
+					try:
+						pts = parse_waypoints_file(full_row['Path'])
+						if pts:
+							path_points = [[p['lon'], p['lat']] for p in pts]
+							state = get_shared_state()
+							import time
+							state.update({
+								'mission_points': path_points,
+								'mission_dl_total': len(path_points),
+								'mission_dl_received': len(path_points),
+								'mission_dl_active': False,
+								'mission_dl_done_ts': time.time(),
+							})
+					except Exception as e:
+						st.warning(f"Mission preview update failed: {e}")
+
 					mission_items = mavlink_utils.parse_mission_file(full_row['Path'])
 					if mission_items:
 						state = get_shared_state()

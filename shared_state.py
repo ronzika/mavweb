@@ -23,6 +23,8 @@ class SharedState:
             'battery_pct': 0,
             'messages': [],
             'mission_points': [],
+            # Breadcrumbs: list of [lon, lat] points for rover trail.
+            'history': [],
             # Latest mission index reported by the vehicle (may jump to 0 on disarm/stop).
             'wp_current_raw': 0,
             # Waypoint index shown in UI (can intentionally ignore raw resets to 0).
@@ -70,7 +72,13 @@ class SharedState:
 
     def set_connection(self, conn):
         with self.lock:
+            was_connected = self.connection is not None
             self.connection = conn
+
+            # Clear rover breadcrumbs when the link drops.
+            if conn is None and was_connected:
+                self.rover_data['history'] = []
+                self.rover_data['last_update'] = time.time()
 
     def get_connection(self):
         with self.lock:

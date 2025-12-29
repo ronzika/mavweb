@@ -544,6 +544,7 @@ def mavlink_worker(endpoint, state):
     mission_download_active = False
     mission_next_seq = 0
     mission_last_req_time = 0
+    last_auto_mission_list_req_ts = 0.0
 
     while True:
         # Check if a new worker has taken over
@@ -558,6 +559,7 @@ def mavlink_worker(endpoint, state):
         raw_lq_history = []
         last_sparkline_update = 0
         mission_download_active = False
+        last_auto_mission_list_req_ts = 0.0
         
         try:
             state.append_message(f"Attempting MAVLink: {endpoint}")
@@ -784,16 +786,84 @@ def mavlink_worker(endpoint, state):
                     data['mode'] = get_mode_name(msg.custom_mode)
                     data['armed'] = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
 
+                    # If we're in AUTO and we don't yet know total waypoints, request mission list.
+                    # This prompts the vehicle to send MISSION_COUNT (and we can then compute mission progress).
+                    try:
+                        mode_name = str(data.get('mode') or '')
+                        known_total = int(state.get().get('mission_dl_total') or 0)
+                    except Exception:
+                        mode_name = ''
+                        known_total = 0
+
+                    now_ts = time.time()
+                    if (
+                        mode_name == 'AUTO'
+                        and known_total <= 0
+                        and (not mission_download_active)
+                        and (now_ts - last_auto_mission_list_req_ts) >= 5.0
+                    ):
+                        try:
+                            with state.acquire_mav_lock():
+                                conn.mav.mission_request_list_send(conn.target_system, conn.target_component)
+                            mission_download_active = True
+                            mission_next_seq = 0
+                            mission_last_req_time = time.time()
+                            last_auto_mission_list_req_ts = now_ts
+                            state.update({'mission_dl_active': True, 'mission_dl_total': 0, 'mission_dl_received': 0, 'mission_dl_done_ts': 0.0})
+                            state.append_message("[Worker] AUTO mode: requesting mission list to compute progress")
+                        except Exception:
+                            last_auto_mission_list_req_ts = now_ts
+
                 elif mtype == 'GLOBAL_POSITION_INT':
                     if msg.lat != 0 and msg.lon != 0:
                         data['lat'] = msg.lat / 1e7
                         data['lon'] = msg.lon / 1e7
                         data['heading_deg'] = msg.hdg / 100.0
+
+                        # Breadcrumbs
+                        try:
+                            snap_hist = state.get().get('history') or []
+                            history = list(snap_hist)
+                        except Exception:
+                            history = []
+                        pt = [float(data['lon']), float(data['lat'])]
+                        if not history:
+                            history.append(pt)
+                        else:
+                            last = history[-1]
+                            if (
+                                abs(float(last[0]) - pt[0]) > 1e-6
+                                or abs(float(last[1]) - pt[1]) > 1e-6
+                            ):
+                                history.append(pt)
+                        if len(history) > 5000:
+                            history = history[-5000:]
+                        data['history'] = history
                 
                 elif mtype == 'GPS_RAW_INT':
                     if msg.lat != 0 and msg.lon != 0:
                         data['lat'] = msg.lat / 1e7
                         data['lon'] = msg.lon / 1e7
+
+                        # Breadcrumbs
+                        try:
+                            snap_hist = state.get().get('history') or []
+                            history = list(snap_hist)
+                        except Exception:
+                            history = []
+                        pt = [float(data['lon']), float(data['lat'])]
+                        if not history:
+                            history.append(pt)
+                        else:
+                            last = history[-1]
+                            if (
+                                abs(float(last[0]) - pt[0]) > 1e-6
+                                or abs(float(last[1]) - pt[1]) > 1e-6
+                            ):
+                                history.append(pt)
+                        if len(history) > 5000:
+                            history = history[-5000:]
+                        data['history'] = history
                     data['gps1_fix'] = get_gps_fix_string(msg.fix_type)
                     data['satellites_visible'] = msg.satellites_visible
 
@@ -1028,7 +1098,7 @@ def generate_sparkline(data, width=280, height=40, color="#4caf50"):
     min_val = 0
     max_val = 100
     points = []
-    
+
     # Fixed max points to ensure scrolling effect (matches history buffer size)
     max_points = 50
     step = width / (max_points - 1)
@@ -1280,6 +1350,9 @@ metric_wp = c6.empty()
 
 st.markdown('<hr style="border:0;border-top:2px solid #fff;margin:8px 0 8px 0;">', unsafe_allow_html=True)
 
+# Mission Progress Placeholder (above map)
+mission_progress_placeholder = st.empty()
+
 # Map Placeholder
 map_placeholder = st.empty()
 
@@ -1397,6 +1470,31 @@ def _render_live_sidebar():
 @st.fragment(run_every=1.5)
 def _render_live_map():
     current_data = get_shared_state().get()
+
+    # Mission progress (only show while in AUTO)
+    current_mode = str(current_data.get('mode') or '')
+    if current_mode != 'AUTO':
+        mission_progress_placeholder.empty()
+    else:
+        try:
+            wp_current = int(current_data.get('wp_current') or 0)
+        except Exception:
+            wp_current = 0
+
+        total_wps = int(current_data.get('mission_dl_total') or 0)
+        if total_wps <= 0:
+            pts = current_data.get('mission_points') or []
+            if isinstance(pts, list):
+                total_wps = len(pts)
+
+        with mission_progress_placeholder.container():
+            if total_wps > 0:
+                denom = max(total_wps - 1, 1)
+                frac = max(0.0, min(1.0, wp_current / denom))
+                shown_cur = min(max(wp_current + 1, 1), total_wps)
+                st.progress(frac, text=f"Mission progress {shown_cur}/{total_wps}")
+            else:
+                st.progress(0.0, text="Mission progress: awaiting mission…")
 
     # Map style comes from session_state (set by the sidebar controls fragment)
     try:
