@@ -1,8 +1,4 @@
-import base64
-import socket
-import re
 import os
-import json
 import time
 import math
 import threading
@@ -208,6 +204,10 @@ def _render_sidebar_controls():
     cmd_conn = get_shared_state().get_connection()
     is_disabled = not cmd_conn
 
+    # Snapshot rover state for command enable/disable decisions.
+    state_snapshot = get_shared_state().get()
+    is_armed_now = bool(state_snapshot.get('armed', False))
+
     st.subheader("Commands")
 
     if st.button("MANUAL", use_container_width=True, disabled=is_disabled, key="cmd_manual"):
@@ -237,7 +237,7 @@ def _render_sidebar_controls():
             except Exception as e:
                 st.error(f"Failed to set mode: {e}")
 
-    if st.button("ARM", use_container_width=True, disabled=is_disabled, key="cmd_arm"):
+    if st.button("ARM", use_container_width=True, disabled=(is_disabled or is_armed_now), key="cmd_arm"):
         if cmd_conn:
             try:
                 with get_shared_state().acquire_mav_lock():
@@ -258,7 +258,7 @@ def _render_sidebar_controls():
             except Exception as e:
                 st.error(f"Failed to arm: {e}")
 
-    if st.button("Disarm", use_container_width=True, disabled=is_disabled, key="cmd_disarm"):
+    if st.button("Disarm", use_container_width=True, disabled=(is_disabled or (not is_armed_now)), key="cmd_disarm"):
         if cmd_conn:
             try:
                 with get_shared_state().acquire_mav_lock():
@@ -280,9 +280,7 @@ def _render_sidebar_controls():
                 st.error(f"Failed to disarm: {e}")
 
     # Reboot Flight Controller (only allowed when disarmed)
-    state_snapshot = get_shared_state().get()
-    is_armed = bool(state_snapshot.get('armed', False))
-    reboot_disabled = is_disabled or is_armed
+    reboot_disabled = is_disabled or is_armed_now
 
     if "confirm_reboot_fc" not in st.session_state:
         st.session_state["confirm_reboot_fc"] = False
@@ -1272,7 +1270,7 @@ def mavlink_worker(endpoint, state):
                     #     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Mission Complete detected. Resetting WP to 0.")
                     #     try:
                     #         with state.acquire_mav_lock():
-                    #             conn.mav.mission_set_current_send(conn.target_system, conn.target_component, 0)
+                    #             cmd_conn.mav.mission_set_current_send(conn.target_system, conn.target_component, 0)
                     #         state.append_message("Mission Reset to WP 0")
                     #     except Exception as e:
                     #         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Failed to reset mission: {e}")
@@ -1844,7 +1842,7 @@ def _render_live_sidebar():
 """
     if current_data.get('gps2_fix'):
         gps_html += f"""
-<hr>
+<br>
 <div style="line-height: 1.2; font-size: 0.9rem;">
     <b>GPS 2:</b> {current_data.get('gps2_fix')}<br>
     Lat: {current_data.get('gps2_lat') or 'N/A'}<br>
@@ -1922,9 +1920,21 @@ def _render_live_console():
 
 
 try:
+    
     _render_live_metrics()
     _render_live_map()
     _render_live_console()
+
+    # MQTT publish (best-effort; never crash UI)
+    mqtt_enabled = (os.getenv("MQTT_ENABLED", "") or "").strip().lower()
+    if mqtt_enabled not in ("", "0", "false", "no", "off"):
+        try:
+            from mavweb_mqtt import _publish_stats
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] Publishing MQTT stats...")
+            _publish_stats()
+        except Exception:
+            pass
+
     # Sidebar: invoke fragments inside a sidebar context.
     with st.sidebar:
         st.title("🎮 MavWeb (ver .80)")
