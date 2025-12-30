@@ -11,6 +11,7 @@ class SharedState:
             'armed': False,
             'lat': None,
             'lon': None,
+            'alt_m': None,
             'heading_deg': 0,
             'speed_ms': 0,
             'gps1_fix': 'No Fix',
@@ -23,6 +24,9 @@ class SharedState:
             'battery_pct': 0,
             'messages': [],
             'mission_points': [],
+            # Full mission items as dicts (when downloaded via MAVLink mission protocol).
+            # Used for features like "Save Waypoint" which must preserve non-position mission commands.
+            'mission_items': [],
             # Breadcrumbs: list of [lon, lat] points for rover trail.
             'history': [],
             # Latest mission index reported by the vehicle (may jump to 0 on disarm/stop).
@@ -56,6 +60,7 @@ class SharedState:
         self.connection = None
         self.upload_queue = queue.Queue()
         self.mission_fetch_queue = queue.Queue()
+        self.save_wp_queue = queue.Queue()
         self.upload_status = {'status': 'idle', 'message': ''}
         self.current_worker_id = None
 

@@ -32,7 +32,14 @@ load_dotenv(dotenv_path=env_path, override=True)
 MAVLINK_ENDPOINT = os.getenv("MAVLINK_ENDPOINT", "udpin:0.0.0.0:14550")
 MAPBOX_API_KEY = os.getenv("MAPBOX_API_KEY")
 DEBUG = os.getenv("DEBUG", "0") != "0"
-MAVSDK_SYSTEM_ADDRESS = (os.getenv("MAVSDK_SYSTEM_ADDRESS", "") or "udp://:14540").strip()
+#MAVSDK_SYSTEM_ADDRESS = (os.getenv("MAVSDK_SYSTEM_ADDRESS", "") or "udp://:14540").strip()
+
+# Optional relay controls (set RELAY1..RELAY6 in .env to enable)
+RELAY_LABELS: dict[int, str] = {
+    i: (os.getenv(f"RELAY{i}", "") or "").strip()
+    for i in range(1, 7)
+    if (os.getenv(f"RELAY{i}", "") or "").strip()
+}
 
 # Mission transfer tuning (speed)
 MISSION_FETCH_METHOD = (os.getenv("MISSION_FETCH_METHOD", "mavlink") or "mavlink").strip().lower()
@@ -233,6 +240,65 @@ def _render_sidebar_controls():
             except Exception as e:
                 st.error(f"Failed to disarm: {e}")
 
+    # Reboot Flight Controller (only allowed when disarmed)
+    state_snapshot = get_shared_state().get()
+    is_armed = bool(state_snapshot.get('armed', False))
+    reboot_disabled = is_disabled or is_armed
+
+    if "confirm_reboot_fc" not in st.session_state:
+        st.session_state["confirm_reboot_fc"] = False
+
+    # If the rover becomes armed (or command becomes invalid), drop any pending confirmation.
+    if reboot_disabled and st.session_state.get("confirm_reboot_fc", False):
+        st.session_state["confirm_reboot_fc"] = False
+
+    if st.button("Reboot FC", use_container_width=True, disabled=reboot_disabled, key="cmd_reboot_fc"):
+        st.session_state["confirm_reboot_fc"] = True
+
+    if st.session_state.get("confirm_reboot_fc", False):
+        st.warning("Are you sure?")
+
+        col_confirm, col_cancel = st.columns(2)
+        with col_confirm:
+            if st.button(
+                "Yes",
+                use_container_width=True,
+                disabled=reboot_disabled,
+                key="cmd_reboot_fc_confirm",
+            ):
+                if cmd_conn and not is_armed:
+                    try:
+                        # MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN
+                        # param1=1 -> reboot autopilot
+                        with get_shared_state().acquire_mav_lock():
+                            cmd_conn.mav.command_long_send(
+                                cmd_conn.target_system,
+                                cmd_conn.target_component,
+                                mavutil.mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN,
+                                0,
+                                1,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                            )
+                        get_shared_state().append_message("[UI] Sent Reboot FC command")
+                        st.toast("Sent Reboot FC")
+                    except Exception as e:
+                        get_shared_state().append_message(f"[UI] Failed to reboot FC: {e}")
+
+                st.session_state["confirm_reboot_fc"] = False
+
+        with col_cancel:
+            if st.button(
+                "Cancel",
+                use_container_width=True,
+                key="cmd_reboot_fc_cancel",
+            ):
+                st.session_state["confirm_reboot_fc"] = False
+
     # Reset Mission: set current mission item to 0 (disabled while in AUTO)
     state_snapshot = get_shared_state().get()
     current_mode = str(state_snapshot.get('mode') or '')
@@ -311,6 +377,79 @@ def _render_sidebar_controls():
             except Exception as e:
                 get_shared_state().set_loading(False)
                 get_shared_state().append_message(f"[UI] Failed to request mission: {e}")
+
+    # Save Waypoint: append current position to mission in the FC (disabled in AUTO)
+    state_snapshot = get_shared_state().get()
+    current_mode = str(state_snapshot.get('mode') or '')
+    cur_lat = state_snapshot.get('lat')
+    cur_lon = state_snapshot.get('lon')
+    cur_alt_m = state_snapshot.get('alt_m')
+    save_wp_disabled = is_disabled or (current_mode == 'AUTO') or (cur_lat is None) or (cur_lon is None)
+
+    if st.button("Save Waypoint", use_container_width=True, disabled=save_wp_disabled, key="cmd_save_waypoint"):
+        try:
+            get_shared_state().save_wp_queue.put({
+                'ts': time.time(),
+                'lat': float(cur_lat),
+                'lon': float(cur_lon),
+                'alt_m': (float(cur_alt_m) if cur_alt_m is not None else None),
+            })
+            get_shared_state().append_message("[UI] Save Waypoint requested")
+            st.toast("Save Waypoint requested")
+        except Exception as e:
+            get_shared_state().append_message(f"[UI] Failed to request Save Waypoint: {e}")
+
+    # Breadcrumbs
+    if st.button("Clear Breadcrumbs", use_container_width=True, key="cmd_clear_breadcrumbs"):
+        try:
+            get_shared_state().update({'history': []})
+            get_shared_state().append_message("[UI] Cleared breadcrumb history")
+            st.toast("Breadcrumbs cleared")
+        except Exception as e:
+            get_shared_state().append_message(f"[UI] Failed to clear breadcrumbs: {e}")
+
+    # Relay toggles (only shown when RELAY1..RELAY6 are set in .env)
+    if RELAY_LABELS:
+        st.divider()
+        st.subheader("Relays")
+
+        for relay_num in sorted(RELAY_LABELS.keys()):
+            label = RELAY_LABELS[relay_num]
+            toggle_key = f"relay_toggle_{relay_num}"
+            last_sent_key = f"relay_last_sent_{relay_num}"
+
+            if toggle_key not in st.session_state:
+                st.session_state[toggle_key] = False
+            if last_sent_key not in st.session_state:
+                st.session_state[last_sent_key] = bool(st.session_state[toggle_key])
+
+            val = st.toggle(label, key=toggle_key, disabled=is_disabled)
+
+            # Debounce: only send when the user changes the toggle.
+            if (not is_disabled) and (bool(st.session_state[last_sent_key]) != bool(val)) and cmd_conn:
+                try:
+                    desired = 1 if val else 0
+                    # ArduPilot uses 0-based relay numbering for MAV_CMD_DO_SET_RELAY:
+                    # Mission Planner "Relay 1" corresponds to relay index 0.
+                    ap_relay_index = int(relay_num) - 1
+                    with get_shared_state().acquire_mav_lock():
+                        cmd_conn.mav.command_long_send(
+                            cmd_conn.target_system,
+                            cmd_conn.target_component,
+                            mavutil.mavlink.MAV_CMD_DO_SET_RELAY,
+                            0,
+                            float(ap_relay_index),
+                            float(desired),
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        )
+                    st.session_state[last_sent_key] = bool(val)
+                    get_shared_state().append_message(f"[UI] Relay {relay_num} set to {desired} ({label})")
+                except Exception as e:
+                    get_shared_state().append_message(f"[UI] Relay {relay_num} command failed: {e}")
 
     st.divider()
     st.subheader("Map Settings")
@@ -553,6 +692,7 @@ def mavlink_worker(endpoint, state):
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Starting MAVLink Worker {worker_id}")
 
     _mission_cache = {}
+    _mission_items_cache = {}
     _mission_total = 0
     
     # Link Quality Tracking
@@ -568,6 +708,11 @@ def mavlink_worker(endpoint, state):
     mission_last_req_time = 0
     last_auto_mission_list_req_ts = 0.0
 
+    # Breadcrumb gating: only record breadcrumbs when at least one GPS has RTK Float/Fixed
+    # When RTK is not present, we pause updates but keep the last trail visible.
+    gps1_rtk_ok = False
+    gps2_rtk_ok = False
+
     while True:
         # Check if a new worker has taken over
         if state.current_worker_id != worker_id:
@@ -582,6 +727,9 @@ def mavlink_worker(endpoint, state):
         last_sparkline_update = 0
         mission_download_active = False
         last_auto_mission_list_req_ts = 0.0
+
+        gps1_rtk_ok = False
+        gps2_rtk_ok = False
         
         try:
             state.append_message(f"Attempting MAVLink: {endpoint}")
@@ -663,12 +811,111 @@ def mavlink_worker(endpoint, state):
                 except Exception:
                     pass
             last_heartbeat = 0
+            pending_save_wp = None
             while True:
                 # Check if superseded
                 if state.current_worker_id != worker_id:
                     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Stopping MAVLink Worker {worker_id} (Superseded)")
                     conn.close()
                     return
+
+                # Handle pending "Save Waypoint" requests.
+                # We preserve the current mission by downloading full mission items (if needed),
+                # then appending a NAV_WAYPOINT at the rover's current position and re-uploading.
+                try:
+                    while not state.save_wp_queue.empty():
+                        pending_save_wp = state.save_wp_queue.get_nowait()
+                except Exception:
+                    pass
+
+                if pending_save_wp is not None:
+                    try:
+                        snap = state.get()
+                    except Exception:
+                        snap = {}
+
+                    ul_active = bool(snap.get('mission_ul_active', False))
+                    dl_active = bool(snap.get('mission_dl_active', False))
+                    have_items = bool(snap.get('mission_items'))
+
+                    if ul_active or dl_active:
+                        # Wait until transfers complete.
+                        pass
+                    elif not have_items:
+                        # Need mission items to preserve the existing mission.
+                        try:
+                            state.append_message("[Worker] Save WP: requesting mission list (need full mission items)")
+                            with state.acquire_mav_lock():
+                                conn.mav.mission_request_list_send(conn.target_system, conn.target_component)
+                            mission_download_active = True
+                            mission_next_seq = 0
+                            mission_last_req_time = time.time()
+                            state.update({'mission_dl_active': True, 'mission_dl_total': 0, 'mission_dl_received': 0, 'mission_dl_done_ts': 0.0})
+                        except Exception as e:
+                            state.append_message(f"[Worker] Save WP: mission list request failed: {e}")
+                            pending_save_wp = None
+                    else:
+                        try:
+                            base_items = list(snap.get('mission_items') or [])
+                        except Exception:
+                            base_items = []
+
+                        try:
+                            lat = float(pending_save_wp.get('lat'))
+                            lon = float(pending_save_wp.get('lon'))
+                        except Exception:
+                            lat = None
+                            lon = None
+
+                        try:
+                            alt_m = float(pending_save_wp.get('alt_m')) if pending_save_wp.get('alt_m') is not None else 0.0
+                        except Exception:
+                            alt_m = 0.0
+
+                        if lat is None or lon is None:
+                            state.append_message("[Worker] Save WP: missing lat/lon; ignoring")
+                            pending_save_wp = None
+                        else:
+                            # Normalize mission items to sequential seq values.
+                            new_items = []
+                            for it in base_items:
+                                try:
+                                    new_items.append(dict(it))
+                                except Exception:
+                                    continue
+
+                            for i, it in enumerate(new_items):
+                                it['seq'] = int(i)
+                                it['current'] = 0
+                                it['autocontinue'] = int(it.get('autocontinue', 1) or 1)
+
+                            # Append a simple NAV_WAYPOINT at current position.
+                            new_items.append({
+                                'seq': int(len(new_items)),
+                                'current': 0,
+                                'frame': int(mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT),
+                                'command': int(mavutil.mavlink.MAV_CMD_NAV_WAYPOINT),
+                                'param1': 0.0,
+                                'param2': 0.0,
+                                'param3': 0.0,
+                                'param4': 0.0,
+                                'x': float(lat),
+                                'y': float(lon),
+                                'z': float(alt_m),
+                                'autocontinue': 1,
+                            })
+
+                            # Optimistically update mission overlay in UI.
+                            try:
+                                pts = list(snap.get('mission_points') or [])
+                                pts.append([float(lon), float(lat)])
+                                state.update({'mission_points': pts, 'mission_items': new_items})
+                            except Exception:
+                                state.update({'mission_items': new_items})
+
+                            state.upload_queue.put(new_items)
+                            state.append_message(f"[Worker] Save WP: appended waypoint at {lat:.7f}, {lon:.7f}")
+                            pending_save_wp = None
 
                 # Handle mission fetch requests
                 try:
@@ -868,51 +1115,67 @@ def mavlink_worker(endpoint, state):
                         data['lat'] = msg.lat / 1e7
                         data['lon'] = msg.lon / 1e7
                         data['heading_deg'] = msg.hdg / 100.0
-
-                        # Breadcrumbs
                         try:
-                            snap_hist = state.get().get('history') or []
-                            history = list(snap_hist)
+                            # relative_alt is in millimeters
+                            data['alt_m'] = float(getattr(msg, 'relative_alt', 0) or 0) / 1000.0
                         except Exception:
-                            history = []
-                        pt = [float(data['lon']), float(data['lat'])]
-                        if not history:
-                            history.append(pt)
-                        else:
-                            last = history[-1]
-                            if (
-                                abs(float(last[0]) - pt[0]) > 1e-6
-                                or abs(float(last[1]) - pt[1]) > 1e-6
-                            ):
+                            pass
+
+                        # Breadcrumbs (only when RTK is available on at least one GPS)
+                        breadcrumbs_enabled = bool(gps1_rtk_ok or gps2_rtk_ok)
+                        if breadcrumbs_enabled:
+                            try:
+                                snap_hist = state.get().get('history') or []
+                                history = list(snap_hist)
+                            except Exception:
+                                history = []
+                            pt = [float(data['lon']), float(data['lat'])]
+                            if not history:
                                 history.append(pt)
-                        if len(history) > 5000:
-                            history = history[-5000:]
-                        data['history'] = history
+                            else:
+                                last = history[-1]
+                                if (
+                                    abs(float(last[0]) - pt[0]) > 1e-6
+                                    or abs(float(last[1]) - pt[1]) > 1e-6
+                                ):
+                                    history.append(pt)
+                            if len(history) > 5000:
+                                history = history[-5000:]
+                            data['history'] = history
                 
                 elif mtype == 'GPS_RAW_INT':
                     if msg.lat != 0 and msg.lon != 0:
                         data['lat'] = msg.lat / 1e7
                         data['lon'] = msg.lon / 1e7
 
-                        # Breadcrumbs
-                        try:
-                            snap_hist = state.get().get('history') or []
-                            history = list(snap_hist)
-                        except Exception:
-                            history = []
-                        pt = [float(data['lon']), float(data['lat'])]
-                        if not history:
-                            history.append(pt)
-                        else:
-                            last = history[-1]
-                            if (
-                                abs(float(last[0]) - pt[0]) > 1e-6
-                                or abs(float(last[1]) - pt[1]) > 1e-6
-                            ):
+                    # Update RTK gating state for GPS1
+                    try:
+                        gps1_rtk_ok = int(getattr(msg, 'fix_type', 0) or 0) in (5, 6)
+                    except Exception:
+                        gps1_rtk_ok = False
+
+                    # Breadcrumbs (only when RTK is available on at least one GPS)
+                    breadcrumbs_enabled = bool(gps1_rtk_ok or gps2_rtk_ok)
+                    if (msg.lat != 0 and msg.lon != 0) and breadcrumbs_enabled:
+                            try:
+                                snap_hist = state.get().get('history') or []
+                                history = list(snap_hist)
+                            except Exception:
+                                history = []
+                            pt = [float(data['lon']), float(data['lat'])]
+                            if not history:
                                 history.append(pt)
-                        if len(history) > 5000:
-                            history = history[-5000:]
-                        data['history'] = history
+                            else:
+                                last = history[-1]
+                                if (
+                                    abs(float(last[0]) - pt[0]) > 1e-6
+                                    or abs(float(last[1]) - pt[1]) > 1e-6
+                                ):
+                                    history.append(pt)
+                            if len(history) > 5000:
+                                history = history[-5000:]
+                            data['history'] = history
+
                     data['gps1_fix'] = get_gps_fix_string(msg.fix_type)
                     data['satellites_visible'] = msg.satellites_visible
 
@@ -942,6 +1205,13 @@ def mavlink_worker(endpoint, state):
                 elif mtype == 'GPS2_RAW':
                     if msg.lat != 0 and msg.lon != 0:
                         data['gps2_lat'], data['gps2_lon'] = msg.lat / 1e7, msg.lon / 1e7
+
+                    # Update RTK gating state for GPS2
+                    try:
+                        gps2_rtk_ok = int(getattr(msg, 'fix_type', 0) or 0) in (5, 6)
+                    except Exception:
+                        gps2_rtk_ok = False
+
                     data['gps2_fix'] = get_gps_fix_string(msg.fix_type)
                     data['gps2_satellites_visible'] = msg.satellites_visible
 
@@ -1035,6 +1305,7 @@ def mavlink_worker(endpoint, state):
                         continue
 
                     _mission_cache = {}
+                    _mission_items_cache = {}
                     _mission_total = msg.count
                     state.update({'mission_dl_active': True, 'mission_dl_total': int(_mission_total), 'mission_dl_received': 0, 'mission_dl_done_ts': 0.0})
                     if DEBUG:
@@ -1050,6 +1321,7 @@ def mavlink_worker(endpoint, state):
                     else:
                         # Handle empty mission
                         state.update({'mission_points': []})
+                        state.update({'mission_items': []})
                         state.append_message("Mission loaded: 0 points")
                         with state.acquire_mav_lock():
                             conn.mav.mission_ack_send(conn.target_system, conn.target_component, 0)
@@ -1084,6 +1356,26 @@ def mavlink_worker(endpoint, state):
 
                     # Store as [lon, lat] for PyDeck
                     _mission_cache[msg.seq] = [lon, lat]
+
+                    # Also cache the full mission item (so we can later append a waypoint without losing commands).
+                    try:
+                        _mission_items_cache[msg.seq] = {
+                            'seq': int(getattr(msg, 'seq', 0) or 0),
+                            'current': int(getattr(msg, 'current', 0) or 0),
+                            'frame': int(getattr(msg, 'frame', 0) or 0),
+                            'command': int(getattr(msg, 'command', 0) or 0),
+                            'param1': float(getattr(msg, 'param1', 0.0) or 0.0),
+                            'param2': float(getattr(msg, 'param2', 0.0) or 0.0),
+                            'param3': float(getattr(msg, 'param3', 0.0) or 0.0),
+                            'param4': float(getattr(msg, 'param4', 0.0) or 0.0),
+                            # Store x/y as degrees when global; upload_mission() will convert to INT as needed.
+                            'x': float(lat),
+                            'y': float(lon),
+                            'z': float(getattr(msg, 'z', 0.0) or 0.0),
+                            'autocontinue': int(getattr(msg, 'autocontinue', 1) or 1),
+                        }
+                    except Exception:
+                        pass
                     # Progress
                     try:
                         state.update({'mission_dl_received': int(len(_mission_cache))})
@@ -1103,6 +1395,11 @@ def mavlink_worker(endpoint, state):
                         mission_download_active = False
                         sorted_pts = [v for k, v in sorted(_mission_cache.items())]
                         state.update({'mission_points': sorted_pts})
+                        try:
+                            sorted_items = [v for k, v in sorted(_mission_items_cache.items())]
+                        except Exception:
+                            sorted_items = []
+                        state.update({'mission_items': sorted_items})
                         state.update({'mission_dl_active': False, 'mission_dl_total': int(_mission_total), 'mission_dl_received': int(len(sorted_pts)), 'mission_dl_done_ts': time.time()})
                         state.append_message(f"Mission loaded: {len(sorted_pts)} points")
                         with state.acquire_mav_lock():
@@ -1588,7 +1885,7 @@ try:
     _render_live_console()
     # Sidebar: invoke fragments inside a sidebar context.
     with st.sidebar:
-        st.title("🎮 Rover Control")
+        st.title("🎮 MavWeb (ver .80)")
         st.divider()
         _render_live_sidebar()
         st.divider()
