@@ -47,10 +47,29 @@ MISSION_RETRY_INTERVAL_S = float(os.getenv("MISSION_RETRY_INTERVAL_S", "0.2") or
 WORKER_RECV_TIMEOUT_S = float(os.getenv("WORKER_RECV_TIMEOUT_S", "0.1") or 0.1)
 MISSION_PROGRESS_GRACE_S = float(os.getenv("MISSION_PROGRESS_GRACE_S", "3") or 3)
 
-if MAPBOX_API_KEY:
-    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Mapbox Key Loaded: {MAPBOX_API_KEY[:10]}...")
+def _is_valid_mapbox_key(val) -> bool:
+    try:
+        v = str(val or "").strip()
+    except Exception:
+        return False
+    if not v:
+        return False
+    if v.lower() in {"none", "null", "undefined"}:
+        return False
+    # Most Mapbox public tokens start with pk. (or sk. for secret).
+    # Keep validation light: avoid rejecting tokens that work, but ignore obvious junk.
+    if not (v.startswith("pk.") or v.startswith("sk.")):
+        return False
+    return len(v) >= 20
+
+
+MAPBOX_API_KEY_VALID = _is_valid_mapbox_key(MAPBOX_API_KEY)
+MAP_BASE_PROVIDER = "mapbox" if MAPBOX_API_KEY_VALID else "carto"
+
+if MAPBOX_API_KEY_VALID:
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Mapbox Key Loaded: {str(MAPBOX_API_KEY)[:10]}...")
 else:
-    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] WARNING: Mapbox Key NOT Found!")
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] WARNING: Mapbox Key missing/invalid; using Carto basemap.")
 
 st.set_page_config(page_title="Rover GCS", layout="wide", initial_sidebar_state="expanded")
 
@@ -137,20 +156,40 @@ def _parse_qgc_wpl_text_to_lonlat(text: str) -> list[list[float]]:
 
 
 # Map style options (used by sidebar fragment + map fragment)
-map_styles = {
-    "Satellite": "mapbox://styles/mapbox/satellite-v9",
-    "Satellite Streets": "mapbox://styles/mapbox/satellite-streets-v12",
-    "Streets": "mapbox://styles/mapbox/streets-v11",
-    "Dark": "mapbox://styles/mapbox/dark-v10",
-    "Light": "mapbox://styles/mapbox/light-v10",
-    "Outdoors": "mapbox://styles/mapbox/outdoors-v11",
-}
+# If Mapbox key is not available/valid, fall back to Carto basemaps so the map still renders.
+if MAPBOX_API_KEY_VALID:
+    map_styles = {
+        "Satellite": "mapbox://styles/mapbox/satellite-v9",
+        "Satellite Streets": "mapbox://styles/mapbox/satellite-streets-v12",
+        "Streets": "mapbox://styles/mapbox/streets-v11",
+        "Dark": "mapbox://styles/mapbox/dark-v10",
+        "Light": "mapbox://styles/mapbox/light-v10",
+        "Outdoors": "mapbox://styles/mapbox/outdoors-v11",
+    }
+else:
+    # These identifiers are understood by pydeck for the Carto provider.
+    map_styles = {
+        "Dark": "dark",
+        "Light": "light",
+        "Road": "road",
+        "Satellite": "satellite",
+        "Dark (No Labels)": "dark_no_labels",
+        "Light (No Labels)": "light_no_labels",
+    }
+
 map_options = list(map_styles.keys())
 
-if "map_style_ind" not in st.session_state:
-    st.session_state["map_style_ind"] = 3
-if "map_style_select_fixed" not in st.session_state:
-    st.session_state["map_style_select_fixed"] = map_options[st.session_state["map_style_ind"]]
+default_map_style_name = "Dark" if "Dark" in map_styles else (map_options[0] if map_options else "Dark")
+
+# Initialize / repair session state if options changed (e.g., Mapbox key removed).
+sel = st.session_state.get("map_style_select_fixed")
+if (not sel) or (sel not in map_options):
+    st.session_state["map_style_select_fixed"] = default_map_style_name
+
+try:
+    st.session_state["map_style_ind"] = map_options.index(st.session_state["map_style_select_fixed"])
+except Exception:
+    st.session_state["map_style_ind"] = 0
 
 
 def update_map_style():
@@ -1462,7 +1501,7 @@ def generate_sparkline(data, width=280, height=40, color="#4caf50"):
     """
 
 # --- UI Functions ---
-def create_map_deck(data, map_style='mapbox://styles/mapbox/satellite-v9'):
+def create_map_deck(data, map_style=None):
     # if DEBUG:
     #     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG] Map: Creating map deck.")
     lat, lon = data.get('lat'), data.get('lon')
@@ -1581,13 +1620,16 @@ def create_map_deck(data, map_style='mapbox://styles/mapbox/satellite-v9'):
         line_width_min_pixels=1,
     ))
 
+    if not map_style:
+        map_style = "mapbox://styles/mapbox/satellite-v9" if MAPBOX_API_KEY_VALID else "dark"
+
     return pdk.Deck(
         initial_view_state=view_state, 
         layers=layers, 
         tooltip=True, 
         map_style=map_style,
-        map_provider="mapbox",
-        api_keys={"mapbox": MAPBOX_API_KEY} if MAPBOX_API_KEY else None
+        map_provider=MAP_BASE_PROVIDER,
+        api_keys={"mapbox": MAPBOX_API_KEY} if MAPBOX_API_KEY_VALID else None
     )
 
 
