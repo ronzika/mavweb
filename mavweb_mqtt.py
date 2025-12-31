@@ -11,6 +11,7 @@ Environment variables:
 - MQTT_USERNAME=...
 - MQTT_PASSWORD=...
 - MQTT_TOPIC_PREFIX=mavweb
+- MQTT_VAR1_TOPIC=some/topic   (optional; if empty, subscription is disabled)
 """
 
 from __future__ import annotations
@@ -19,7 +20,6 @@ import json
 import os
 import time
 from typing import Any, Optional
-import streamlit as st
 import paho.mqtt.client as mqtt
 
 from shared_state import get_shared_state
@@ -62,16 +62,27 @@ def _make_topics(prefix: str) -> dict[str, str]:
 _client: Optional[mqtt.Client] = None
 _client_connected: bool = False
 
+# Subscription state for MQTT_VAR1_TOPIC (lazy; set up on connect)
+_var1_topic: str = ""
+_var1_subscribed: bool = False
+
+
+def _get_var1_topic() -> str:
+    return (os.getenv("MQTT_VAR1_TOPIC", "") or "").strip()
+
 
 def get_mqtt_client() -> Optional[mqtt.Client]:
     """
     Returns a connected MQTT client if MQTT is enabled; otherwise returns None.
     Connection is established lazily and cached at module level.
     """
-    global _client, _client_connected
+    global _client, _client_connected, _var1_topic, _var1_subscribed
 
     if not _env_bool("MQTT_ENABLED", default=False):
         return None
+
+    # Refresh desired subscription topic from env (so changing .env + restart works)
+    _var1_topic = _get_var1_topic()
 
     if _client is None:
         _client = mqtt.Client(client_id=os.getenv("MAVLINK_NAME", "mavweb") or "mavweb")
@@ -83,15 +94,44 @@ def get_mqtt_client() -> Optional[mqtt.Client]:
 
         def _on_connect(client, userdata, flags, rc, properties=None):
             # rc==0 => OK
-            global _client_connected
+            global _client_connected, _var1_subscribed
             _client_connected = (rc == 0)
+
+            # Subscribe (or re-subscribe) on connect if topic is configured.
+            if _client_connected and _var1_topic:
+                try:
+                    client.subscribe(_var1_topic, qos=0)
+                    _var1_subscribed = True
+                    #print(f"[MQTT] Subscribed to topic {_var1_topic}")
+                except Exception:
+                    _var1_subscribed = False
 
         def _on_disconnect(client, userdata, rc, properties=None):
             global _client_connected
             _client_connected = False
+            global _var1_subscribed
+            _var1_subscribed = False
+
+        def _on_message(client, userdata, msg: mqtt.MQTTMessage):
+            # Only handle the configured var1 topic (ignore everything else)
+            try:
+                if not _var1_topic or msg.topic != _var1_topic:
+                    return
+
+                raw = msg.payload.decode("utf-8", errors="ignore").strip()
+                if raw == "":
+                    return
+
+                val = float(raw)
+                get_shared_state().update({'mqtt_var1': float(val)})
+                #print(f"[MQTT] Received {val} on topic {msg.topic}")
+            except Exception:
+                # Best-effort; never crash
+                return
 
         _client.on_connect = _on_connect
         _client.on_disconnect = _on_disconnect
+        _client.on_message = _on_message
 
     if not _client_connected:
         host = (os.getenv("MQTT_BROKER_URL", "") or "").strip()
@@ -109,10 +149,19 @@ def get_mqtt_client() -> Optional[mqtt.Client]:
         while not _client_connected and (time.time() - t0) < 1.0:
             time.sleep(0.01)
 
+    # If we connected successfully but didn’t subscribe yet (e.g., topic set after client existed),
+    # subscribe lazily here as well.
+    if _client_connected and _var1_topic and (not _var1_subscribed):
+        try:
+            _client.subscribe(_var1_topic, qos=0)
+            _var1_subscribed = True
+        except Exception:
+            _var1_subscribed = False
+
     return _client if _client_connected else None
 
-@st.fragment(run_every=2)
-def _publish_stats(client: Optional[mqtt.Client] = None) -> bool:
+
+def publish_stats(client: Optional[mqtt.Client] = None) -> bool:
     """
     Publishes all available MAVLink/rover state from SharedState to MQTT.
 

@@ -41,6 +41,8 @@ class SharedState:
             'link_quality_history': [],
             'packets_received': 0,
             'packets_lost': 0,
+            'mqtt_var1': 0, # planning to pull from mqtt. RPi temp sensor posts the data to mqtt
+            'mqtt_var2': 0, 
 
             # Mission transfer progress (batch operation UX)
             'mission_dl_active': False,

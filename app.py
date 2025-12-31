@@ -1830,6 +1830,31 @@ def _render_live_sidebar():
     sparkline_svg = generate_sparkline(lq_hist, color=lq_color)
     st.markdown(sparkline_svg, unsafe_allow_html=True)
 
+    # Box Temp sparkline (from MQTT_VAR1_TOPIC -> SharedState.mqtt_var1)
+    try:
+        box_temp_val = float(current_data.get('mqtt_var1', 0) or 0)
+    except Exception:
+        box_temp_val = 0.0
+    box_temp_i = int(round(box_temp_val))
+
+    if "mqtt_var1_history" not in st.session_state:
+        st.session_state["mqtt_var1_history"] = []
+    if "_last_mqtt_var1_hist_ts" not in st.session_state:
+        st.session_state["_last_mqtt_var1_hist_ts"] = 0.0
+
+    now_ts = time.time()
+    if (now_ts - float(st.session_state.get("_last_mqtt_var1_hist_ts") or 0.0)) >= 1.0:
+        hist = list(st.session_state.get("mqtt_var1_history") or [])
+        hist.append(box_temp_i)
+        if len(hist) > 50:
+            hist = hist[-50:]
+        st.session_state["mqtt_var1_history"] = hist
+        st.session_state["_last_mqtt_var1_hist_ts"] = now_ts
+
+    st.markdown(f"**Box Temp:** {box_temp_i}")
+    bt_hist = st.session_state.get("mqtt_var1_history") or []
+    st.markdown(generate_sparkline(bt_hist, color="#4caf50"), unsafe_allow_html=True)
+
     gps_html = f"""
 <div style="line-height: 1.2; font-size: 0.9rem;">
     <b>Link Quality:</b> <span style="color:{lq_color}; font-weight:bold;">{lq}%</span><br>
@@ -1929,9 +1954,9 @@ try:
     mqtt_enabled = (os.getenv("MQTT_ENABLED", "") or "").strip().lower()
     if mqtt_enabled not in ("", "0", "false", "no", "off"):
         try:
-            from mavweb_mqtt import _publish_stats
+            from mavweb_mqtt import publish_stats
             print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] Publishing MQTT stats...")
-            _publish_stats()
+            publish_stats()
         except Exception:
             pass
 
