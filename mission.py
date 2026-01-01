@@ -7,9 +7,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 import mavlink_utils
 from shared_state import get_shared_state
 
-
-#def render():
-st.title('Mission Management')
+st.title(':material/moving: Mission Management')
 missions_dir = os.path.join(os.path.dirname(__file__), 'missions')
 
 uploaded_files = st.file_uploader(

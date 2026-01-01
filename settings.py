@@ -7,7 +7,8 @@ import config
 from shared_state import get_shared_state
 
 def load_env_vars():
-    env_path = Path(__file__).resolve().parents[1] / '.env'
+    env_path = Path(__file__).parent / '.env'
+
     env_vars = {}
     if env_path.exists():
         with open(env_path) as f:
@@ -27,7 +28,7 @@ def save_env_vars(new_vars):
             f.write(f'{k}={v}\n')
 
 
-st.title('Settings')
+st.title(':material/settings: MavWeb Settings')
 st.info('Edit and save environment variables. Changes will be written to .env.')
 env_vars = load_env_vars()
 current = {k: st.session_state.get(f'env_{k}', v) for k, v in env_vars.items()}
@@ -42,5 +43,3 @@ with st.form('env_form'):
         st.session_state['Pages'] = 'Dashboard'
         st.success('.env updated! Reloading app...')
         st.rerun()
-
-print(env_vars)
