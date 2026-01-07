@@ -17,6 +17,39 @@ from pymavlink import mavftp
 from shared_state import get_shared_state
 from mavlink_utils import upload_mission
 import mavsdk_mission
+import streamlit.components.v1 as components
+
+# SVG = """
+# <svg xmlns="http://www.w3.org/2000/svg"
+#      viewBox="0 0 225 225"
+#      style="width:100%; height:auto;"
+#      aria-label="Zero turn mower silhouette"
+#      role="img">
+
+#   <style>
+#     .mower {
+#       fill: #2ECC71;   /* <-- CHANGE COLOR HERE */
+#     }
+#   </style>
+
+#   <path class="mower" fill-rule="evenodd" d="
+# M 224.0 133.5 L 203.0 149.5 L 197.5 149.0 L 193.5 137.0 L 186.0 133.5 L 180.5 126.0 L 180.5 117.0 L 183.5 112.0 L 197.0 103.5 L 203.0 103.5 L 216.5 112.0 L 224.0 121.5 L 224.0 133.5 Z
+# M 174.0 178.5 L 162.0 178.5 L 156.0 176.5 L 145.5 167.0 L 141.5 155.0 L 143.5 146.0 L 151.0 137.5 L 160.0 133.5 L 170.0 133.5 L 180.5 138.0 L 187.5 146.0 L 189.5 155.0 L 187.5 165.0 L 181.0 174.5 L 174.0 178.5 Z
+# M 142.0 98.5 L 107.0 98.5 L 102.5 95.0 L 101.5 90.0 L 105.0 84.5 L 110.0 82.5 L 142.0 82.5 L 150.0 84.5 L 155.5 90.0 L 154.5 95.0 L 149.5 98.5 L 142.0 98.5 Z
+# M 104.0 165.5 L 53.0 165.5 L 48.5 160.0 L 48.5 150.0 L 52.0 145.5 L 104.0 145.5 L 108.5 150.0 L 108.5 160.0 L 104.0 165.5 Z
+# M 0.0 156.5 L 3.5 150.0 L 8.0 146.5 L 13.0 144.5 L 21.0 144.5 L 24.0 146.5 L 24.0 177.5 L 12.0 178.5 L 2.5 172.0 L 0.0 166.5 L 0.0 156.5 Z
+# M 98.0 183.5 L 60.0 183.5 L 55.5 180.0 L 54.5 175.0 L 58.0 170.5 L 64.0 168.5 L 98.0 168.5 L 105.0 170.5 L 110.5 175.0 L 109.5 180.0 L 104.5 183.5 L 98.0 183.5 Z
+# M 77.0 121.5 L 64.0 121.5 L 60.5 119.0 L 60.5 110.0 L 64.0 107.5 L 77.0 107.5 L 80.5 110.0 L 80.5 119.0 L 77.0 121.5 Z
+# M 33.0 112.5 L 23.0 112.5 L 20.5 110.0 L 20.5 101.0 L 23.0 98.5 L 33.0 98.5 L 35.5 101.0 L 35.5 110.0 L 33.0 112.5 Z
+# M 41.0 98.5 L 35.5 95.0 L 35.5 86.0 L 41.0 82.5 L 53.0 82.5 L 58.5 86.0 L 58.5 95.0 L 53.0 98.5 L 41.0 98.5 Z
+# " />
+# </svg>
+# """
+
+# with st.sidebar:
+#     # optional spacing control
+#     st.markdown("<div style='margin-top:-8px'></div>", unsafe_allow_html=True)
+#     components.html(SVG, height=220)
 
 # --- Configuration ---
 env_path = Path(__file__).parent / '.env'
@@ -405,7 +438,7 @@ def _render_sidebar_controls():
             except Exception as e:
                 get_shared_state().append_message(f"[UI] Failed to skip waypoint: {e}")
 
-    if st.button("Fetch Mission", use_container_width=True, disabled=is_disabled, key="cmd_fetch_mission"):
+    if st.button("Fetch Mission Map", use_container_width=True, disabled=is_disabled, key="cmd_fetch_mission"):
         if cmd_conn:
             try:
                 get_shared_state().set_loading(True)
@@ -1082,36 +1115,44 @@ def mavlink_worker(endpoint, state):
                     seq = msg.get_seq()
                     if last_seq is not None:
                         diff = (seq - last_seq) % 256
-                        lost = diff - 1
-                        if lost < 0: lost = 0
-                        
-                        if lost > 0:
-                            packet_history.extend([0] * lost)
-                        packet_history.append(1)
-                        
-                        if len(packet_history) > WINDOW_SIZE:
-                            packet_history = packet_history[-WINDOW_SIZE:]
-                        
-                        lq = (sum(packet_history) / len(packet_history)) * 100
-                        data['link_quality'] = int(lq)
-                        
-                        # Update history for sparkline (Smoothed)
-                        raw_lq_history.append(lq)
-                        if len(raw_lq_history) > 20:
-                            raw_lq_history.pop(0)
-                        
-                        if time.time() - last_sparkline_update > 1.0:
-                            smoothed_lq = sum(raw_lq_history) / len(raw_lq_history)
-                            current_hist = state.get().get('link_quality_history', [])
-                            current_hist.append(int(smoothed_lq))
-                            if len(current_hist) > 50:
-                                current_hist = current_hist[-50:]
-                            data['link_quality_history'] = current_hist
-                            last_sparkline_update = time.time()
-                        
+                        # diff values:
+                        # - 1: normal next packet
+                        # - 0: duplicate packet (ignore for LQ)
+                        # - >128: likely out-of-order/backwards jump (ignore for LQ)
+                        if diff != 0 and diff <= 128:
+                            lost = diff - 1
+                            if lost < 0:
+                                lost = 0
+
+                            if lost > 0:
+                                packet_history.extend([0] * lost)
+                            packet_history.append(1)
+
+                            if len(packet_history) > WINDOW_SIZE:
+                                packet_history = packet_history[-WINDOW_SIZE:]
+
+                            lq = (sum(packet_history) / len(packet_history)) * 100
+                            data['link_quality'] = int(lq)
+
+                            # Update history for sparkline (Smoothed)
+                            raw_lq_history.append(lq)
+                            if len(raw_lq_history) > 20:
+                                raw_lq_history.pop(0)
+
+                            if time.time() - last_sparkline_update > 1.0:
+                                smoothed_lq = sum(raw_lq_history) / len(raw_lq_history)
+                                current_hist = state.get().get('link_quality_history', [])
+                                current_hist.append(int(smoothed_lq))
+                                if len(current_hist) > 50:
+                                    current_hist = current_hist[-50:]
+                                data['link_quality_history'] = current_hist
+                                last_sparkline_update = time.time()
+
+                            # Only advance baseline when we accepted the packet for accounting.
+                            last_seq = seq
                     else:
                         packet_history.append(1)
-                    last_seq = seq
+                        last_seq = seq
                 except Exception:
                     pass
 
@@ -1492,9 +1533,20 @@ def generate_sparkline(min_val, max_val, data, width=280, height=40, color="#4ca
         points.append(f"{x},{y}")
     
     polyline = " ".join(points)
+    # return f"""
+    # <svg width="100%" height="{height}" viewBox="0 0 {width} {height}" preserveAspectRatio="none" style="background-color: rgba(255,255,255,0.05); border-radius: 3px; margin-bottom: 5px;">
+    #     <polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="2" />
+    # </svg>
+    # """
     return f"""
     <svg width="100%" height="{height}" viewBox="0 0 {width} {height}" preserveAspectRatio="none" style="background-color: rgba(255,255,255,0.05); border-radius: 3px; margin-bottom: 5px;">
-        <polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="2" />
+    <polygon 
+        points="{polyline} {width},{height} 0,{height}" 
+        fill="{color}" 
+        fill-opacity="0.3" 
+        stroke="none" 
+    />
+    <polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="2" />
     </svg>
     """
 
@@ -1857,25 +1909,7 @@ def _render_live_sidebar():
     lq_color =  "#f44336" if box_temp_i > 85 else "#ff9800" if box_temp_i > 0 else "#4caf50"
     st.markdown(generate_sparkline(32, 130,bt_hist, color=lq_color), unsafe_allow_html=True)
     st.markdown(f":material/device_thermostat: **Box Temperature:** {box_temp_i} °F")
-#     if not st.session_state.get("_material_symbols_loaded"):
-#         st.markdown(
-#             '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined" />',
-#             unsafe_allow_html=True,
-#         )
-#         st.session_state["_material_symbols_loaded"] = True
 
-#     st.markdown(
-#         f"""
-# <div style=\"display:flex; align-items:center; gap:6px;\">
-#   <span class=\"material-symbols-outlined\" style=\"font-size:18px; line-height:1; color:{lq_color};\">satellite_alt</span>
-#   <span><b>Box Temp:</b> {box_temp_i} °F</span>
-# </div>
-# """,
-#         unsafe_allow_html=True,
-#     )
-
-#   <b>Link Quality:</b> <span style="color:{lq_color}; font-weight:bold;">{lq}%</span><br>\
-#:material/sattelite_alt:
     gps_html = f"""
 <div style="line-height: 1.2; font-size: 0.9rem;">
     <hr style="margin: 5px 0; border-color: #333;">
@@ -1896,6 +1930,13 @@ def _render_live_sidebar():
 </div>
 """
     st.markdown(gps_html, unsafe_allow_html=True)
+
+    # st.markdown("""
+    # ### <u>GPS 1: &nbsp;RTK Fix</u>
+    # - **Lat:** &nbsp;38.4045464
+    # - **Lon:** -90.233347
+    # - **Sats:** 10
+    # """, unsafe_allow_html=True)    
 
 @st.fragment(run_every=1.5)
 def _render_live_map():
@@ -1949,6 +1990,17 @@ def _render_live_map():
     else:
         map_placeholder.info("🛰️ Waiting for GPS Position...")
 
+@st.fragment(run_every=5.0)
+def _mqtt_publish_tick():
+    mqtt_enabled = (os.getenv("MQTT_ENABLED", "") or "").strip().lower()
+    if mqtt_enabled in ("", "0", "false", "no", "off"):
+        return
+    try:
+        from mavweb_mqtt import publish_stats
+        publish_stats()
+    except Exception:
+        # best-effort; never break UI
+        pass
 
 @st.fragment(run_every=0.8)
 def _render_live_console():
@@ -1967,9 +2019,11 @@ try:
     _render_live_metrics()
     _render_live_map()
     _render_live_console()
+    _mqtt_publish_tick()
 
     # MQTT publish (best-effort; never crash UI)
     mqtt_enabled = (os.getenv("MQTT_ENABLED", "") or "").strip().lower()
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] MQTT_ENABLED={mqtt_enabled}")
     if mqtt_enabled not in ("", "0", "false", "no", "off"):
         try:
             from mavweb_mqtt import publish_stats

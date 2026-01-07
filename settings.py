@@ -22,7 +22,8 @@ def load_env_vars():
     return env_vars
 
 def save_env_vars(new_vars):
-    env_path = Path(__file__).resolve().parents[1] / '.env'
+  #  env_path = Path(__file__).resolve().parents[1] / '.env'
+    env_path = Path(__file__).parent / '.env'
     with open(env_path, 'w') as f:
         for k, v in new_vars.items():
             f.write(f'{k}={v}\n')

@@ -1,0 +1,15 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+.venv/
+.streamlit/
+.env
+
+# local/editor
+.vscode/
+.DS_Store
+
+# caches
+**/.pytest_cache/
+**/.mypy_cache/

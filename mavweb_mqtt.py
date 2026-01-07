@@ -12,6 +12,7 @@ Environment variables:
 - MQTT_PASSWORD=...
 - MQTT_TOPIC_PREFIX=mavweb
 - MQTT_VAR1_TOPIC=some/topic   (optional; if empty, subscription is disabled)
+- MQTT_HOME_ASSISTANT_TOPIC=homeassistant   (optional; enables Home Assistant discovery + tracker updates)
 """
 
 from __future__ import annotations
@@ -66,9 +67,139 @@ _client_connected: bool = False
 _var1_topic: str = ""
 _var1_subscribed: bool = False
 
+# Home Assistant discovery state (publish discovery once, then update tracker state/attrs)
+_ha_discovery_published: bool = False
+_ha_last_lat: Optional[float] = None
+_ha_last_lon: Optional[float] = None
+_ha_last_pub_ts: float = 0.0
+
 
 def _get_var1_topic() -> str:
     return (os.getenv("MQTT_VAR1_TOPIC", "") or "").strip()
+
+
+def _get_ha_discovery_prefix() -> str:
+    # Home Assistant MQTT discovery prefix is commonly "homeassistant".
+    return (os.getenv("MQTT_HOME_ASSISTANT_TOPIC", "") or "").strip().strip("/")
+
+
+def _as_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def publish_home_assistant_rover_tracker(
+    client: Optional[mqtt.Client] = None,
+    state_snapshot: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Publish Home Assistant MQTT discovery + GPS updates for a device_tracker named "Rover".
+
+    Runs only when:
+    - MQTT_ENABLED is truthy
+    - MQTT_HOME_ASSISTANT_TOPIC is set (non-blank)
+
+    Discovery (retained):
+    - <ha_prefix>/device_tracker/rover/config
+
+    Runtime updates:
+    - <prefix>/rover/device_tracker/state          (state string)
+    - <prefix>/rover/device_tracker/attributes     (JSON attributes with lat/lon)
+    """
+    global _ha_discovery_published, _ha_last_lat, _ha_last_lon, _ha_last_pub_ts
+
+    if not _env_bool("MQTT_ENABLED", default=False):
+        return False
+
+    ha_prefix = _get_ha_discovery_prefix()
+    if not ha_prefix:
+        return False
+
+    if client is None:
+        client = get_mqtt_client()
+    if client is None:
+        return False
+
+    if state_snapshot is None:
+        state_snapshot = get_shared_state().get()
+
+    prefix = os.getenv("MQTT_TOPIC_PREFIX", "mavweb") or "mavweb"
+    base = prefix.strip().strip("/") or "mavweb"
+
+    object_id = "rover"
+    unique_id = "mavweb_rover"
+
+    state_topic = f"{ha_prefix}/rover/device_tracker/state"
+    attrs_topic = f"{ha_prefix}/rover/device_tracker/attributes"
+
+    # 1) Discovery (retain so HA finds it after restarts)
+    if not _ha_discovery_published:
+        config_topic = f"{ha_prefix}/device_tracker/{object_id}/config"
+        payload = {
+            "name": "Rover",
+            "unique_id": unique_id,
+            "state_topic": state_topic,
+            "json_attributes_topic": attrs_topic,
+            "source_type": "gps",
+            "device": {
+                "identifiers": [unique_id],
+                "name": "Rover",
+                "manufacturer": "mavweb",
+                "model": "ArduPilot Rover",
+            },
+        }
+        client.publish(config_topic, json.dumps(payload, separators=(",", ":")), qos=0, retain=True)
+        _ha_discovery_published = True
+
+    # 2) Position updates (publish only when we have coordinates)
+    lat = _as_float(state_snapshot.get("lat"))
+    lon = _as_float(state_snapshot.get("lon"))
+
+    if lat is None or lon is None:
+        return False
+
+    now = time.time()
+    # Throttle: publish at most 1 Hz unless coordinates changed.
+    changed = (
+        _ha_last_lat is None
+        or _ha_last_lon is None
+        or abs(lat - _ha_last_lat) > 1e-7
+        or abs(lon - _ha_last_lon) > 1e-7
+    )
+    if (not changed) and (now - _ha_last_pub_ts) < 1.0:
+        return True
+
+    # For HA device_tracker, state is typically home/not_home; GPS coords live in attributes.
+    client.publish(state_topic, "not_home", qos=0, retain=False)
+
+    attrs: dict[str, Any] = {
+        "latitude": lat,
+        "longitude": lon,
+    }
+
+    alt_m = _as_float(state_snapshot.get("alt_m"))
+    if alt_m is not None:
+        attrs["altitude"] = alt_m
+
+    heading = _as_float(state_snapshot.get("heading"))
+    if heading is not None:
+        attrs["course"] = heading
+
+    speed = _as_float(state_snapshot.get("speed"))
+    if speed is not None:
+        attrs["speed"] = speed
+
+    client.publish(attrs_topic, json.dumps(attrs, default=_json_default, separators=(",", ":")), qos=0, retain=False)
+    print (f"[MQTT] Published Home Assistant rover tracker update: lat={lat} lon={lon}")
+    _ha_last_lat = lat
+    _ha_last_lon = lon
+    _ha_last_pub_ts = now
+    return True
 
 
 def get_mqtt_client() -> Optional[mqtt.Client]:
@@ -172,6 +303,7 @@ def publish_stats(client: Optional[mqtt.Client] = None) -> bool:
 
     Returns True if publish succeeded (connected + enqueued), else False.
     """
+
     if client is None:
         client = get_mqtt_client()
     if client is None:
@@ -202,5 +334,13 @@ def publish_stats(client: Optional[mqtt.Client] = None) -> bool:
 
     # Meta timestamp
     client.publish(f"{topics['meta']}/ts", str(now), qos=0, retain=False)
+
+    # Optional: Home Assistant tracker integration
+    # (safe best-effort; never fail publish_stats)
+    try:
+        publish_home_assistant_rover_tracker(client=client, state_snapshot=state_snapshot)
+        print (f"[MQTT] Published stats to {topics['state']} and per-key topics")
+    except Exception:
+        pass
 
     return True
