@@ -765,12 +765,22 @@ def mavlink_worker(endpoint, state):
     _mission_items_cache = {}
     _mission_total = 0
     
-    # Link Quality Tracking
-    last_seq = None
-    packet_history = []
+    # Link Quality Tracking (per-source PRR + EWMA + stale-link decay)
+    per_source_seq: dict[tuple[int, int], int] = {}
+    per_source_history: dict[tuple[int, int], list[int]] = {}
     WINDOW_SIZE = 100
-    raw_lq_history = [] # For smoothing
-    last_sparkline_update = 0
+    EWMA_ALPHA = 0.2
+    STALE_DECAY_START_S = 2.0
+    STALE_DECAY_PER_S = 20.0
+    ewma_lq = 100.0
+    last_packet_ts = time.time()
+    last_decay_eval_ts = time.time()
+    last_sparkline_update = 0.0
+
+    # Radio-health signal from RADIO_STATUS deltas
+    radio_prev_rxerrors = None
+    radio_prev_fixed = None
+    radio_health_ewma = 100.0
     
     # Mission Download State
     mission_download_active = False
@@ -778,7 +788,7 @@ def mavlink_worker(endpoint, state):
     mission_last_req_time = 0
     last_auto_mission_list_req_ts = 0.0
 
-    # Breadcrumb gating: only record breadcrumbs when at least one GPS has RTK Float/Fixed
+    # Breadcrumb gating: only record breadcrumbs when at least one GPS has RTK Fixed
     # When RTK is not present, we pause updates but keep the last trail visible.
     gps1_rtk_ok = False
     gps2_rtk_ok = False
@@ -791,10 +801,15 @@ def mavlink_worker(endpoint, state):
 
         conn = None
         state.set_connection(None)
-        last_seq = None
-        packet_history = []
-        raw_lq_history = []
-        last_sparkline_update = 0
+        per_source_seq = {}
+        per_source_history = {}
+        ewma_lq = 100.0
+        last_packet_ts = time.time()
+        last_decay_eval_ts = time.time()
+        last_sparkline_update = 0.0
+        radio_prev_rxerrors = None
+        radio_prev_fixed = None
+        radio_health_ewma = 100.0
         mission_download_active = False
         last_auto_mission_list_req_ts = 0.0
 
@@ -1099,6 +1114,23 @@ def mavlink_worker(endpoint, state):
 
                 msg = conn.recv_match(blocking=True, timeout=WORKER_RECV_TIMEOUT_S)
                 if not msg:
+                    now_ts = time.time()
+                    # Decay link quality when packets stop arriving.
+                    idle_s = now_ts - last_packet_ts
+                    if idle_s > STALE_DECAY_START_S:
+                        dt = max(0.0, now_ts - last_decay_eval_ts)
+                        if dt > 0:
+                            ewma_lq = max(0.0, ewma_lq - (STALE_DECAY_PER_S * dt))
+                            decay_data = {'link_quality': int(round(ewma_lq))}
+                            if now_ts - last_sparkline_update > 1.0:
+                                current_hist = state.get().get('link_quality_history', [])
+                                current_hist.append(int(round(ewma_lq)))
+                                if len(current_hist) > 50:
+                                    current_hist = current_hist[-50:]
+                                decay_data['link_quality_history'] = current_hist
+                                last_sparkline_update = now_ts
+                            state.update(decay_data)
+                    last_decay_eval_ts = now_ts
                     # Check for link timeout
                     if time.time() - state.get()['last_update'] > 5:
                         state.update({'link_active': False})
@@ -1108,51 +1140,67 @@ def mavlink_worker(endpoint, state):
                 if mtype == 'BAD_DATA':
                     continue
 
+                now_ts = time.time()
+                last_packet_ts = now_ts
+                last_decay_eval_ts = now_ts
+
                 data = {'link_active': True}
 
                 # Link Quality Calculation
                 try:
                     seq = msg.get_seq()
-                    if last_seq is not None:
-                        diff = (seq - last_seq) % 256
+                    src_key = (int(msg.get_srcSystem()), int(msg.get_srcComponent()))
+                    src_last_seq = per_source_seq.get(src_key)
+                    src_hist = per_source_history.get(src_key)
+                    if src_hist is None:
+                        src_hist = []
+
+                    accepted_for_accounting = False
+                    if src_last_seq is None:
+                        src_hist.append(1)
+                        per_source_seq[src_key] = seq
+                        accepted_for_accounting = True
+                    else:
+                        diff = (seq - src_last_seq) % 256
                         # diff values:
                         # - 1: normal next packet
                         # - 0: duplicate packet (ignore for LQ)
                         # - >128: likely out-of-order/backwards jump (ignore for LQ)
                         if diff != 0 and diff <= 128:
-                            lost = diff - 1
-                            if lost < 0:
-                                lost = 0
-
+                            lost = max(0, diff - 1)
                             if lost > 0:
-                                packet_history.extend([0] * lost)
-                            packet_history.append(1)
+                                src_hist.extend([0] * lost)
+                            src_hist.append(1)
+                            per_source_seq[src_key] = seq
+                            accepted_for_accounting = True
 
-                            if len(packet_history) > WINDOW_SIZE:
-                                packet_history = packet_history[-WINDOW_SIZE:]
+                    if len(src_hist) > WINDOW_SIZE:
+                        src_hist = src_hist[-WINDOW_SIZE:]
+                    per_source_history[src_key] = src_hist
 
-                            lq = (sum(packet_history) / len(packet_history)) * 100
-                            data['link_quality'] = int(lq)
+                    if accepted_for_accounting:
+                        total_seen = 0
+                        total_received = 0
+                        for hist in per_source_history.values():
+                            total_seen += len(hist)
+                            total_received += sum(hist)
 
-                            # Update history for sparkline (Smoothed)
-                            raw_lq_history.append(lq)
-                            if len(raw_lq_history) > 20:
-                                raw_lq_history.pop(0)
+                        if total_seen > 0:
+                            prr = (total_received / total_seen) * 100.0
+                            ewma_lq = (EWMA_ALPHA * prr) + ((1.0 - EWMA_ALPHA) * ewma_lq)
+                            est_lost = max(0, total_seen - total_received)
 
-                            if time.time() - last_sparkline_update > 1.0:
-                                smoothed_lq = sum(raw_lq_history) / len(raw_lq_history)
+                            data['link_quality'] = int(round(ewma_lq))
+                            data['packets_received'] = int(total_received)
+                            data['packets_lost'] = int(est_lost)
+
+                            if now_ts - last_sparkline_update > 1.0:
                                 current_hist = state.get().get('link_quality_history', [])
-                                current_hist.append(int(smoothed_lq))
+                                current_hist.append(int(round(ewma_lq)))
                                 if len(current_hist) > 50:
                                     current_hist = current_hist[-50:]
                                 data['link_quality_history'] = current_hist
-                                last_sparkline_update = time.time()
-
-                            # Only advance baseline when we accepted the packet for accounting.
-                            last_seq = seq
-                    else:
-                        packet_history.append(1)
-                        last_seq = seq
+                                last_sparkline_update = now_ts
                 except Exception:
                     pass
 
@@ -1199,7 +1247,7 @@ def mavlink_worker(endpoint, state):
                         except Exception:
                             pass
 
-                        # Breadcrumbs (only when RTK is available on at least one GPS)
+                        # Breadcrumbs (only when RTK Fixed is available on at least one GPS)
                         breadcrumbs_enabled = bool(gps1_rtk_ok or gps2_rtk_ok)
                         if breadcrumbs_enabled:
                             try:
@@ -1226,13 +1274,13 @@ def mavlink_worker(endpoint, state):
                         data['lat'] = msg.lat / 1e7
                         data['lon'] = msg.lon / 1e7
 
-                    # Update RTK gating state for GPS1
+                    # Update RTK gating state for GPS1 (RTK Fixed only)
                     try:
-                        gps1_rtk_ok = int(getattr(msg, 'fix_type', 0) or 0) in (5, 6)
+                        gps1_rtk_ok = int(getattr(msg, 'fix_type', 0) or 0) == 6
                     except Exception:
                         gps1_rtk_ok = False
 
-                    # Breadcrumbs (only when RTK is available on at least one GPS)
+                    # Breadcrumbs (only when RTK Fixed is available on at least one GPS)
                     breadcrumbs_enabled = bool(gps1_rtk_ok or gps2_rtk_ok)
                     if (msg.lat != 0 and msg.lon != 0) and breadcrumbs_enabled:
                             try:
@@ -1284,9 +1332,9 @@ def mavlink_worker(endpoint, state):
                     if msg.lat != 0 and msg.lon != 0:
                         data['gps2_lat'], data['gps2_lon'] = msg.lat / 1e7, msg.lon / 1e7
 
-                    # Update RTK gating state for GPS2
+                    # Update RTK gating state for GPS2 (RTK Fixed only)
                     try:
-                        gps2_rtk_ok = int(getattr(msg, 'fix_type', 0) or 0) in (5, 6)
+                        gps2_rtk_ok = int(getattr(msg, 'fix_type', 0) or 0) == 6
                     except Exception:
                         gps2_rtk_ok = False
 
@@ -1300,6 +1348,30 @@ def mavlink_worker(endpoint, state):
                 elif mtype == 'VFR_HUD':
                     data['speed_ms'] = round(msg.groundspeed, 2)
                     data['heading_deg'] = msg.heading
+
+                elif mtype == 'RADIO_STATUS':
+                    try:
+                        data['radio_rssi'] = int(getattr(msg, 'rssi', 0) or 0)
+                        data['radio_remrssi'] = int(getattr(msg, 'remrssi', 0) or 0)
+                        data['radio_rxerrors'] = int(getattr(msg, 'rxerrors', 0) or 0)
+                        data['radio_fixed'] = int(getattr(msg, 'fixed', 0) or 0)
+
+                        curr_rxerrors = data['radio_rxerrors']
+                        curr_fixed = data['radio_fixed']
+                        if radio_prev_rxerrors is not None and radio_prev_fixed is not None:
+                            d_rx = curr_rxerrors - radio_prev_rxerrors
+                            d_fix = curr_fixed - radio_prev_fixed
+                            if d_rx >= 0 and d_fix >= 0:
+                                denom = d_rx + d_fix
+                                if denom > 0:
+                                    inst_health = (d_fix / denom) * 100.0
+                                    radio_health_ewma = (0.3 * inst_health) + (0.7 * radio_health_ewma)
+                                    data['radio_health'] = int(round(max(0.0, min(100.0, radio_health_ewma))))
+
+                        radio_prev_rxerrors = curr_rxerrors
+                        radio_prev_fixed = curr_fixed
+                    except Exception:
+                        pass
 
                 elif mtype == 'STATUSTEXT':
                     txt = str(msg.text)
@@ -1880,9 +1952,12 @@ def _render_live_sidebar():
     lq = current_data.get('link_quality', 100)
     lq_color = "#4caf50" if lq >= 90 else "#ff9800" if lq >= 70 else "#f44336"
     lq_hist = current_data.get('link_quality_history', [])
+    radio_health = current_data.get('radio_health', None)
     sparkline_svg = generate_sparkline(0, 100,lq_hist, color=lq_color)
     st.markdown(sparkline_svg, unsafe_allow_html=True)
-    st.markdown(f":material/signal_cellular_alt: **Link Quality:** {lq}%") 
+    st.markdown(f":material/signal_cellular_alt: **Link Quality:** {lq}%")
+    if radio_health is not None:
+        st.markdown(f":material/network_cell: **Radio Health:** {int(radio_health)}%")
 
     # Box Temp sparkline (from MQTT_VAR1_TOPIC -> SharedState.mqtt_var1)
     try:
@@ -1990,7 +2065,7 @@ def _render_live_map():
     else:
         map_placeholder.info("🛰️ Waiting for GPS Position...")
 
-@st.fragment(run_every=5.0)
+@st.fragment(run_every=2.0)
 def _mqtt_publish_tick():
     mqtt_enabled = (os.getenv("MQTT_ENABLED", "") or "").strip().lower()
     if mqtt_enabled in ("", "0", "false", "no", "off"):

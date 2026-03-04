@@ -14,7 +14,7 @@ def load_env_vars():
         with open(env_path) as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith('#'):
+                if not line or line.startswith('#') or line.startswith('MAPBOX_API_KEY'):
                     continue
                 if '=' in line:
                     k, v = line.split('=', 1)

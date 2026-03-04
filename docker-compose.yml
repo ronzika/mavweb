@@ -1,0 +1,15 @@
+services:
+  mavweb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mavweb:local
+    container_name: mavweb
+    ports:
+      - "8500:8500"
+      - "14550:14550/udp"
+    env_file:
+      - .env
+    volumes:
+      - ./.env:/app/.env
+    restart: unless-stopped

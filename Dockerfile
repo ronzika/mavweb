@@ -1,4 +1,7 @@
-# docker run --rm -p 8501:8501 -p 14550:14550/udp mavweb:localdocker run --rm -p 8501:8501 -p 14550:14550/udp mavweb:localdocker run --rm -p 8501:8501 -p 14551:14551/udp mavweb:local
+# Example:
+# docker run --rm -p 8500:8500 -p 14550:14550/udp \
+#   -e MAVLINK_ENDPOINT=udpin:0.0.0.0:14550 mavweb:local
+
 
 FROM python:3.11-slim
 
@@ -8,7 +11,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
     STREAMLIT_SERVER_HEADLESS=true \
     STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
-    STREAMLIT_SERVER_PORT=8501
+    STREAMLIT_SERVER_PORT=8500 \
+    MAVLINK_ENDPOINT=udpin:0.0.0.0:14550
 
 WORKDIR /app
 
@@ -32,6 +36,7 @@ RUN pip install --upgrade pip \
 
 COPY . .
 
-EXPOSE 8501
+EXPOSE 8500
+EXPOSE 14550/udp
 
-CMD ["python", "-m", "streamlit", "run", "app.py", "--server.headless=true", "--server.port=8501", "--server.address=0.0.0.0"]
+CMD ["python", "-m", "streamlit", "run", "app.py", "--server.headless=true", "--server.port=8500", "--server.address=0.0.0.0"]

@@ -41,6 +41,11 @@ class SharedState:
             'link_quality_history': [],
             'packets_received': 0,
             'packets_lost': 0,
+            'radio_health': None,
+            'radio_rssi': None,
+            'radio_remrssi': None,
+            'radio_rxerrors': None,
+            'radio_fixed': None,
             'mqtt_var1': 0, # planning to pull from mqtt. RPi temp sensor posts the data to mqtt
             'mqtt_var2': 0, 
 

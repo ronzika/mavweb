@@ -156,6 +156,19 @@ def publish_home_assistant_rover_tracker(
         client.publish(config_topic, json.dumps(payload, separators=(",", ":")), qos=0, retain=True)
         _ha_discovery_published = True
 
+    # Only publish live position updates in AUTO mode.
+    try:
+        mode_name = str(state_snapshot.get("mode") or "").strip().upper()
+    except Exception:
+        mode_name = ""
+
+    if mode_name != "AUTO":
+        # Reset throttling cache so we publish immediately when entering AUTO.
+        _ha_last_lat = None
+        _ha_last_lon = None
+        _ha_last_pub_ts = 0.0
+        return True
+
     # 2) Position updates (publish only when we have coordinates)
     lat = _as_float(state_snapshot.get("lat"))
     lon = _as_float(state_snapshot.get("lon"))
