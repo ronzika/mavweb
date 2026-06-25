@@ -112,7 +112,7 @@ def upload_mission(master, mission_items, progress_cb=None):
             # Wait for REQUEST or ACK
             # We use a shorter timeout to allow for potential retries or UI updates if needed, 
             # but here we just block.
-            msg = master.recv_match(type=['MISSION_REQUEST', 'MISSION_REQUEST_INT', 'MISSION_ACK'], blocking=True, timeout=5)
+            msg = master.recv_match(type=['MISSION_REQUEST', 'MISSION_REQUEST_INT', 'MISSION_ACK'], blocking=True, timeout=1.5)
             
             if msg is None:
                 print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Timeout waiting for mission request/ack")

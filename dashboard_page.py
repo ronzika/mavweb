@@ -1,6 +1,8 @@
 import os
 import time
 import math
+import io
+import struct
 import threading
 import datetime
 import logging
@@ -18,6 +20,7 @@ from shared_state import get_shared_state
 from mavlink_utils import upload_mission
 import mavsdk_mission
 import streamlit.components.v1 as components
+from telegram_bot import start_telegram_bridge
 
 # SVG = """
 # <svg xmlns="http://www.w3.org/2000/svg"
@@ -72,8 +75,10 @@ RELAY_LABELS: dict[int, str] = {
 
 # Mission transfer tuning (speed)
 MISSION_FETCH_METHOD = (os.getenv("MISSION_FETCH_METHOD", "mavlink") or "mavlink").strip().lower()
+MISSION_UPLOAD_METHOD = (os.getenv("MISSION_UPLOAD_METHOD", "mavlink") or "mavlink").strip().lower()
 MISSION_RETRY_INTERVAL_S = float(os.getenv("MISSION_RETRY_INTERVAL_S", "0.2") or 0.2)
 WORKER_RECV_TIMEOUT_S = float(os.getenv("WORKER_RECV_TIMEOUT_S", "0.1") or 0.1)
+MISSION_REQUEST_WINDOW = max(1, int(os.getenv("MISSION_REQUEST_WINDOW", "3") or 3))
 MISSION_PROGRESS_GRACE_S = float(os.getenv("MISSION_PROGRESS_GRACE_S", "3") or 3)
 
 def material_icon(name, size=24):
@@ -112,6 +117,33 @@ def get_mode_name(custom_mode):
 def get_gps_fix_string(fix_type):
     mapping = {0: 'No GPS', 1: 'No Fix', 2: '2D Fix', 3: '3D Fix', 4: 'DGPS', 5: 'RTK Float', 6: 'RTK Fixed'}
     return mapping.get(fix_type, f"Fix({fix_type})")
+
+
+def format_gps_accuracy(acc_m):
+    try:
+        value_m = float(acc_m)
+    except Exception:
+        return 'N/A'
+
+    if not math.isfinite(value_m) or value_m < 0:
+        return 'N/A'
+
+    if value_m < 0.05:
+        return f"{int(round(value_m * 1000.0))} mm"
+    if value_m < 1.0:
+        return f"{value_m * 100.0:.1f} cm"
+    return f"{value_m:.2f} m"
+
+
+def format_gps_yaw(yaw_deg):
+    try:
+        value_deg = float(yaw_deg)
+    except Exception:
+        return 'N/A'
+
+    if not math.isfinite(value_deg) or value_deg >= 655.35:
+        return 'N/A'
+    return f"{value_deg:.2f} deg"
 
 
 def request_message_interval(conn, msg_id, hz):
@@ -182,6 +214,170 @@ def _parse_qgc_wpl_text_to_lonlat(text: str) -> list[list[float]]:
         return points
     except Exception:
         return []
+
+
+def _parse_ardupilot_mission_dat_to_lonlat(blob: bytes) -> list[list[float]]:
+    """Parse ArduPilot MAVFTP @MISSION/mission.dat into [[lon, lat], ...]."""
+    try:
+        if not blob or len(blob) < 10:
+            return []
+
+        # AP_Filesystem_Mission::header
+        magic, data_type, _options, _start, num_items = struct.unpack_from("<HHHHH", blob, 0)
+        if magic != 0x763D:
+            return []
+        if data_type != 0:
+            return []
+
+        item_fmt = "<ffffiifHHBBBBB"
+        item_size = struct.calcsize(item_fmt)
+        points: list[list[float]] = []
+        offset = 10
+
+        for _ in range(int(num_items)):
+            if offset + item_size > len(blob):
+                break
+            item = struct.unpack_from(item_fmt, blob, offset)
+            offset += item_size
+
+            lat_e7 = int(item[4])
+            lon_e7 = int(item[5])
+            frame = int(item[11])
+
+            if lat_e7 == 0 and lon_e7 == 0:
+                continue
+
+            # Global frames are encoded as degE7 in MISSION_ITEM_INT payload.
+            if frame in {0, 3, 5, 6, 10, 11}:
+                lat = lat_e7 / 1e7
+                lon = lon_e7 / 1e7
+            else:
+                continue
+
+            if abs(lat) < 1e-9 and abs(lon) < 1e-9:
+                continue
+            if abs(lat) > 90.0 or abs(lon) > 180.0:
+                continue
+            points.append([lon, lat])
+
+        return points
+    except Exception:
+        return []
+
+
+def _mission_items_to_qgc_wpl_text(mission_items: list[dict]) -> str:
+    """Serialize mission items to QGC WPL 110 text.
+
+    Preserves command/params/frame where possible so MAVFTP file uploads can
+    reuse the same mission representation used by MAVLink upload flow.
+    """
+    lines = ["QGC WPL 110"]
+    for idx, item in enumerate(mission_items or []):
+        try:
+            seq = int(item.get('seq', idx) or idx)
+        except Exception:
+            seq = idx
+        try:
+            current = int(item.get('current', 1 if seq == 0 else 0) or 0)
+        except Exception:
+            current = 1 if seq == 0 else 0
+        try:
+            frame = int(item.get('frame', 3) or 3)
+        except Exception:
+            frame = 3
+        try:
+            command = int(item.get('command', 16) or 16)
+        except Exception:
+            command = 16
+        try:
+            p1 = float(item.get('param1', 0.0) or 0.0)
+            p2 = float(item.get('param2', 0.0) or 0.0)
+            p3 = float(item.get('param3', 0.0) or 0.0)
+            p4 = float(item.get('param4', 0.0) or 0.0)
+            x = float(item.get('x', 0.0) or 0.0)
+            y = float(item.get('y', 0.0) or 0.0)
+            z = float(item.get('z', 0.0) or 0.0)
+        except Exception:
+            continue
+        try:
+            autocontinue = int(item.get('autocontinue', 1) or 1)
+        except Exception:
+            autocontinue = 1
+
+        lines.append(
+            f"{seq}\t{current}\t{frame}\t{command}\t{p1:.6f}\t{p2:.6f}\t{p3:.6f}\t{p4:.6f}\t{x:.8f}\t{y:.8f}\t{z:.6f}\t{autocontinue}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _try_upload_mission_via_mavftp(conn, mission_items: list[dict], progress_cb=None) -> bool:
+    """Best-effort mission upload via MAVFTP by writing a QGC WPL mission file.
+
+    Returns True when at least one remote path accepted the upload.
+    """
+    tsys = getattr(conn, 'target_system', None)
+    tcomp = getattr(conn, 'target_component', None)
+    if tsys is None or tcomp is None:
+        return False
+
+    text = _mission_items_to_qgc_wpl_text(mission_items)
+    if text.strip() == "QGC WPL 110":
+        return False
+
+    ftp = mavftp.MAVFTP(conn, tsys, tcomp)
+    override_path = (os.getenv("MAVFTP_UPLOAD_PATH", "") or os.getenv("MAVFTP_MISSION_PATH", "")).strip()
+    paths = [
+        p for p in [
+            override_path,
+            "@MISSION/mission.waypoints",
+            "/APM/mission.waypoints",
+            "/mission.waypoints",
+            "/fs/microsd/APM/mission.waypoints",
+        ] if p
+    ]
+
+    # Keep logs quieter unless DEBUG is enabled; MAVFTP can be chatty on failures.
+    root_logger = logging.getLogger()
+    prev_level = root_logger.level
+    if not DEBUG:
+        root_logger.setLevel(logging.ERROR)
+
+    try:
+        payload = text.encode("ascii", errors="ignore")
+        success_code = getattr(mavftp.FtpError, "Success", 0)
+
+        for remote_path in paths:
+            try:
+                try:
+                    ftp.cmd_rm([remote_path])
+                except Exception:
+                    pass
+
+                def _ftp_progress(frac):
+                    if progress_cb is None:
+                        return
+                    try:
+                        pct = max(0.0, min(1.0, float(frac))) if frac is not None else 0.0
+                        total = max(1, int(len(mission_items) or 1))
+                        progress_cb(int(round(total * pct)), total)
+                    except Exception:
+                        pass
+
+                ret0 = ftp.cmd_put([
+                    "mission.waypoints",
+                    remote_path,
+                ], fh=io.BytesIO(payload), progress_callback=_ftp_progress)
+                if getattr(ret0, "error_code", None) != success_code:
+                    continue
+                ret = ftp.process_ftp_reply("CreateFile", timeout=12)
+                if getattr(ret, "error_code", None) == success_code:
+                    return True
+            except Exception:
+                continue
+        return False
+    finally:
+        if not DEBUG:
+            root_logger.setLevel(prev_level)
 
 
 # Map style options (used by sidebar fragment + map fragment)
@@ -487,11 +683,17 @@ def _render_sidebar_controls():
             label = RELAY_LABELS[relay_num]
             toggle_key = f"relay_toggle_{relay_num}"
             last_sent_key = f"relay_last_sent_{relay_num}"
+            current_relays = state_snapshot.get("relays", {})
 
             if toggle_key not in st.session_state:
-                st.session_state[toggle_key] = False
+                st.session_state[toggle_key] = current_relays.get(int(relay_num), False)
             if last_sent_key not in st.session_state:
                 st.session_state[last_sent_key] = bool(st.session_state[toggle_key])
+            
+            # Sync remote changes
+            if st.session_state[last_sent_key] != current_relays.get(int(relay_num), False):
+                st.session_state[toggle_key] = current_relays.get(int(relay_num), False)
+                st.session_state[last_sent_key] = current_relays.get(int(relay_num), False)
 
             val = st.toggle(label, key=toggle_key, disabled=is_disabled)
 
@@ -517,6 +719,12 @@ def _render_sidebar_controls():
                             0,
                         )
                     st.session_state[last_sent_key] = bool(val)
+                    
+                    # Update background state structure
+                    current_relays = get_shared_state().get().get("relays", {})
+                    current_relays[int(relay_num)] = bool(val)
+                    get_shared_state().update({"relays": current_relays})
+                    
                     get_shared_state().append_message(f"[UI] Relay {relay_num} set to {desired} ({label})")
                 except Exception as e:
                     get_shared_state().append_message(f"[UI] Relay {relay_num} command failed: {e}")
@@ -561,7 +769,7 @@ def _try_fetch_mission_via_mavftp(conn) -> list[list[float]]:
     root_logger = logging.getLogger()
     prev_level = root_logger.level
     if not DEBUG:
-        root_logger.setLevel(logging.ERROR)
+        root_logger.setLevel(logging.CRITICAL)
 
     try:
         # Try in this order:
@@ -573,12 +781,17 @@ def _try_fetch_mission_via_mavftp(conn) -> list[list[float]]:
         # Common/special paths and filesystem-like locations used by some firmwares.
         common_guesses = [
             "@MISSION",
+            "@MISSION/mission.dat",
             "@MISSION/mission.waypoints",
             "@MISSION/mission.txt",
+            "/@MISSION/mission.dat",
             "/APM/mission.waypoints",
             "/APM/mission.txt",
+            "/APM/mission.dat",
+            "/mission.dat",
             "/mission.waypoints",
             "/mission.txt",
+            "/fs/microsd/APM/mission.dat",
             "/fs/microsd/APM/mission.waypoints",
             "/fs/microsd/APM/mission.txt",
         ]
@@ -611,8 +824,8 @@ def _try_fetch_mission_via_mavftp(conn) -> list[list[float]]:
         # Discover mission-like files by listing visible directories (bounded).
         discovered: list[tuple[str, int]] = []  # (full_path, size)
 
-        # Start at root and include common firmware dirs.
-        base_dirs = ["/", "/APM", "/fs", "/fs/microsd", "/fs/microsd/APM"]
+        # Start at root and only recurse into dirs we can actually list.
+        base_dirs = ["/"]
         root_entries = _list_dir('/')
         for ent in root_entries:
             try:
@@ -626,6 +839,11 @@ def _try_fetch_mission_via_mavftp(conn) -> list[list[float]]:
             except Exception:
                 continue
 
+        # Prefer known mission-related virtual/firmware dirs when present in root.
+        for known in ("/APM", "/fs", "/mission", "@MISSION"):
+            if known not in base_dirs:
+                base_dirs.append(known)
+
         # De-dup base dirs
         seen_dirs: set[str] = set()
         dirs_to_probe: list[str] = []
@@ -636,7 +854,7 @@ def _try_fetch_mission_via_mavftp(conn) -> list[list[float]]:
 
         # Probe up to 2 levels deep in selected dirs
         def _looks_like_mission_file(name_l: str) -> bool:
-            if not (name_l.endswith('.txt') or name_l.endswith('.waypoints')):
+            if not (name_l.endswith('.txt') or name_l.endswith('.waypoints') or name_l.endswith('.dat')):
                 return False
             return ('mission' in name_l) or ('waypoint' in name_l) or name_l.endswith('.waypoints')
 
@@ -674,7 +892,7 @@ def _try_fetch_mission_via_mavftp(conn) -> list[list[float]]:
                             continue
                         # Only recurse into a small set to avoid slow walk
                         nm_l = (nm or '').lower()
-                        if nm_l in ('apm', 'missions', 'mission', 'wp', 'waypoints') or nm_l.startswith('@'):
+                        if nm_l in ('apm', 'missions', 'mission', 'wp', 'waypoints', 'microsd') or nm_l.startswith('@'):
                             next_level_dirs.append(_join(d, nm))
                         continue
                     name = ent.name or ""
@@ -730,14 +948,22 @@ def _try_fetch_mission_via_mavftp(conn) -> list[list[float]]:
 
         for path in uniq_candidates:
             try:
-                # Avoid OpenFileRO spam by first confirming the file exists via directory listing.
+                # Avoid OpenFileRO spam by pre-checking normal file paths.
+                # Do not pre-filter virtual endpoints (e.g. @MISSION) because they
+                # may not appear as regular files in directory listings.
                 parent, name = _parent_dir_and_name(path)
-                if parent and name:
+                is_virtual = path.startswith('@') or '/@' in path
+                if (not is_virtual) and parent and name:
                     if not _dir_has_file(parent, name):
                         continue
                 blob = ftp.read(path, size=256 * 1024, offset=0)
                 if not blob:
                     continue
+                pts = _parse_ardupilot_mission_dat_to_lonlat(blob)
+                if pts:
+                    if DEBUG:
+                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] MAVFTP mission.dat parsed from {path}: {len(pts)} points")
+                    return pts
                 text = blob.decode('utf-8', errors='ignore')
                 pts = _parse_qgc_wpl_text_to_lonlat(text)
                 if pts:
@@ -784,14 +1010,31 @@ def mavlink_worker(endpoint, state):
     
     # Mission Download State
     mission_download_active = False
+    mission_count_pending = False
     mission_next_seq = 0
     mission_last_req_time = 0
+    _mission_requested = set()
     last_auto_mission_list_req_ts = 0.0
 
     # Breadcrumb gating: only record breadcrumbs when at least one GPS has RTK Fixed
     # When RTK is not present, we pause updates but keep the last trail visible.
     gps1_rtk_ok = False
     gps2_rtk_ok = False
+    last_breadcrumb_ts = 0.0
+
+    # Breadcrumb noise controls for real GPS streams.
+    BREADCRUMB_MIN_STEP_M = 0.8
+    BREADCRUMB_MIN_DT_S = 0.35
+
+    def _distance_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+        # Haversine distance in meters for small-step breadcrumb filtering.
+        r = 6378137.0
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlambda = math.radians(lon2 - lon1)
+        a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+        return 2.0 * r * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
 
     while True:
         # Check if a new worker has taken over
@@ -866,8 +1109,8 @@ def mavlink_worker(endpoint, state):
             for msg_id, hz in TELEMETRY_MESSAGE_INTERVALS:
                 request_message_interval(conn, msg_id, hz)
 
-            def _set_upload_telemetry_throttle(enabled: bool):
-                """Reduce telemetry during mission uploads to prioritize MISSION_* traffic."""
+            def _set_mission_transfer_telemetry_throttle(enabled: bool):
+                """Reduce telemetry during mission transfers to prioritize MISSION_* traffic."""
                 try:
                     if not enabled:
                         # Best-effort: stop legacy stream requests.
@@ -895,6 +1138,58 @@ def mavlink_worker(endpoint, state):
                             request_message_interval(conn, mid, hz)
                 except Exception:
                     pass
+
+            def _start_mission_download():
+                nonlocal mission_download_active, mission_count_pending, mission_next_seq
+                nonlocal mission_last_req_time, _mission_total, _mission_cache
+                nonlocal _mission_items_cache, _mission_requested
+
+                _mission_cache = {}
+                _mission_items_cache = {}
+                _mission_total = 0
+                _mission_requested = set()
+                mission_download_active = True
+                mission_count_pending = True
+                mission_next_seq = 0
+                mission_last_req_time = time.time()
+                state.update({'mission_dl_active': True, 'mission_dl_total': 0, 'mission_dl_received': 0, 'mission_dl_done_ts': 0.0})
+                _set_mission_transfer_telemetry_throttle(False)
+                with state.acquire_mav_lock():
+                    conn.mav.mission_request_list_send(conn.target_system, conn.target_component)
+
+            def _request_mission_window(force: bool = False):
+                nonlocal mission_last_req_time, _mission_requested
+
+                if not mission_download_active or mission_count_pending or _mission_total <= 0:
+                    return 0
+
+                missing_window = []
+                for seq in range(mission_next_seq, int(_mission_total)):
+                    if seq in _mission_cache:
+                        continue
+                    missing_window.append(seq)
+                    if len(missing_window) >= MISSION_REQUEST_WINDOW:
+                        break
+
+                if not missing_window:
+                    return 0
+
+                request_window = missing_window if force else [seq for seq in missing_window if seq not in _mission_requested]
+                if not request_window:
+                    return 0
+
+                with state.acquire_mav_lock():
+                    for seq in request_window:
+                        conn.mav.mission_request_int_send(conn.target_system, conn.target_component, seq)
+                        _mission_requested.add(seq)
+
+                mission_last_req_time = time.time()
+                if DEBUG:
+                    print(
+                        f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] "
+                        f"Worker: Requested mission window {request_window}."
+                    )
+                return len(request_window)
             last_heartbeat = 0
             pending_save_wp = None
             while True:
@@ -930,12 +1225,7 @@ def mavlink_worker(endpoint, state):
                         # Need mission items to preserve the existing mission.
                         try:
                             state.append_message("[Worker] Save WP: requesting mission list (need full mission items)")
-                            with state.acquire_mav_lock():
-                                conn.mav.mission_request_list_send(conn.target_system, conn.target_component)
-                            mission_download_active = True
-                            mission_next_seq = 0
-                            mission_last_req_time = time.time()
-                            state.update({'mission_dl_active': True, 'mission_dl_total': 0, 'mission_dl_received': 0, 'mission_dl_done_ts': 0.0})
+                            _start_mission_download()
                         except Exception as e:
                             state.append_message(f"[Worker] Save WP: mission list request failed: {e}")
                             pending_save_wp = None
@@ -1014,17 +1304,14 @@ def mavlink_worker(endpoint, state):
 
                             print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: Mission fetch requested")
 
-                        method = MISSION_FETCH_METHOD
+                        method = (MISSION_FETCH_METHOD or "mavlink").strip().lower()
+                        if method not in ("mavlink", "mavftp", "mavsdk", "auto"):
+                            method = "mavlink"
 
-                        # Fast default: use MAVLink mission protocol over the already-open connection.
+                        # Default safe path: MAVLink mission protocol over the already-open connection.
                         if method == "mavlink":
-                            with state.acquire_mav_lock():
-                                conn.mav.mission_request_list_send(conn.target_system, conn.target_component)
-                            mission_download_active = True
-                            mission_next_seq = 0
-                            mission_last_req_time = time.time()
-                            state.update({'mission_dl_active': True, 'mission_dl_total': 0, 'mission_dl_received': 0, 'mission_dl_done_ts': 0.0})
-                        elif method == "mavftp":
+                            _start_mission_download()
+                        elif method in ("mavftp", "auto"):
                             pts: list[list[float]] = []
                             try:
                                 with state.acquire_mav_lock():
@@ -1036,21 +1323,20 @@ def mavlink_worker(endpoint, state):
                                 state.update({'mission_points': pts})
                                 state.append_message(f"Mission loaded via MAVFTP: {len(pts)} points")
                             else:
-                                state.append_message("MAVFTP mission fetch failed; using MAVLink mission protocol...")
-                                with state.acquire_mav_lock():
-                                    conn.mav.mission_request_list_send(conn.target_system, conn.target_component)
-                                mission_download_active = True
-                                mission_next_seq = 0
-                                mission_last_req_time = time.time()
-                                state.update({'mission_dl_active': True, 'mission_dl_total': 0, 'mission_dl_received': 0, 'mission_dl_done_ts': 0.0})
+                                if method == "mavftp":
+                                    state.append_message("MAVFTP mission fetch failed.")
+                                else:
+                                    state.append_message("MAVFTP mission fetch failed; using MAVLink mission protocol...")
+                                    _start_mission_download()
                         else:
                             # Opt-in: MAVSDK (requires its own connection/port)
                             pts: list[list[float]] = []
                             try:
-                                if MAVSDK_SYSTEM_ADDRESS:
+                                mavsdk_addr = mavsdk_mission.get_mavsdk_system_address()
+                                if mavsdk_addr:
                                     if DEBUG:
-                                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: MAVSDK download_mission via {MAVSDK_SYSTEM_ADDRESS}")
-                                    pts = mavsdk_mission.download_mission_points_sync(MAVSDK_SYSTEM_ADDRESS, timeout_s=10.0)
+                                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: MAVSDK download_mission via {mavsdk_addr}")
+                                    pts = mavsdk_mission.download_mission_points_sync(mavsdk_addr, timeout_s=10.0)
                             except Exception as e:
                                 if DEBUG:
                                     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: MAVSDK mission download failed: {e}")
@@ -1059,14 +1345,9 @@ def mavlink_worker(endpoint, state):
                                 state.append_message(f"Mission loaded via MAVSDK: {len(pts)} points")
                             else:
                                 state.append_message("MAVSDK mission download failed; using MAVLink mission protocol...")
-                                with state.acquire_mav_lock():
-                                    conn.mav.mission_request_list_send(conn.target_system, conn.target_component)
-                                mission_download_active = True
-                                mission_next_seq = 0
-                                mission_last_req_time = time.time()
-                                state.update({'mission_dl_active': True, 'mission_dl_total': 0, 'mission_dl_received': 0, 'mission_dl_done_ts': 0.0})
-                except Exception:
-                    pass
+                                _start_mission_download()
+                except Exception as e:
+                    state.append_message(f"Mission fetch handler error: {e}")
 
                 # Check for pending mission upload
                 if not state.upload_queue.empty():
@@ -1080,18 +1361,31 @@ def mavlink_worker(endpoint, state):
                             state.update({'mission_ul_active': True, 'mission_ul_total': int(total), 'mission_ul_sent': int(sent)})
                             state.set_upload_status('uploading', f'Uploading {sent}/{total}...')
 
-                        # Use the existing connection to upload.
-                        # Throttle telemetry to speed up MISSION_REQUEST/ITEM exchanges.
-                        _set_upload_telemetry_throttle(False)
-                        try:
-                            success = upload_mission(conn, mission_items, progress_cb=_upload_progress)
-                        finally:
-                            _set_upload_telemetry_throttle(True)
+                        success = False
+                        upload_method = MISSION_UPLOAD_METHOD
+
+                        # Optional fast path for ArduPilot builds that expose mission files via MAVFTP.
+                        if upload_method in ("mavftp", "auto"):
+                            try:
+                                with state.acquire_mav_lock():
+                                    success = _try_upload_mission_via_mavftp(conn, mission_items, progress_cb=_upload_progress)
+                            except Exception:
+                                success = False
+
+                        if not success and upload_method in ("mavlink", "auto"):
+                            # Use the existing connection to upload.
+                            # Throttle telemetry to speed up MISSION_REQUEST/ITEM exchanges.
+                            _set_mission_transfer_telemetry_throttle(False)
+                            try:
+                                success = upload_mission(conn, mission_items, progress_cb=_upload_progress)
+                            finally:
+                                _set_mission_transfer_telemetry_throttle(True)
+
                         if success:
                             state.set_upload_status('success', 'Upload complete!')
                             state.update({'mission_ul_active': False, 'mission_ul_done_ts': time.time()})
                         else:
-                            state.set_upload_status('error', 'Upload failed.')
+                            state.set_upload_status('error', f'Upload failed ({upload_method}).')
                             state.update({'mission_ul_active': False, 'mission_ul_done_ts': time.time()})
                     except Exception as e:
                         state.set_upload_status('error', f'Upload error: {e}')
@@ -1104,13 +1398,19 @@ def mavlink_worker(endpoint, state):
                 
                 # Mission Download Retry Logic
                 if mission_download_active and time.time() - mission_last_req_time > MISSION_RETRY_INTERVAL_S:
-                    if mission_next_seq < _mission_total:
-                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Retry requesting mission item {mission_next_seq}")
+                    if mission_count_pending:
+                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Retry requesting mission list")
                         with state.acquire_mav_lock():
-                            conn.mav.mission_request_int_send(conn.target_system, conn.target_component, mission_next_seq)
+                            conn.mav.mission_request_list_send(conn.target_system, conn.target_component)
                         mission_last_req_time = time.time()
+                    elif mission_next_seq < _mission_total:
+                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [MAVLINK] Retry requesting mission window from {mission_next_seq}")
+                        _request_mission_window(force=True)
                     else:
                         mission_download_active = False
+                        mission_count_pending = False
+                        _mission_requested = set()
+                        _set_mission_transfer_telemetry_throttle(True)
 
                 msg = conn.recv_match(blocking=True, timeout=WORKER_RECV_TIMEOUT_S)
                 if not msg:
@@ -1225,13 +1525,8 @@ def mavlink_worker(endpoint, state):
                         and (now_ts - last_auto_mission_list_req_ts) >= 5.0
                     ):
                         try:
-                            with state.acquire_mav_lock():
-                                conn.mav.mission_request_list_send(conn.target_system, conn.target_component)
-                            mission_download_active = True
-                            mission_next_seq = 0
-                            mission_last_req_time = time.time()
+                            _start_mission_download()
                             last_auto_mission_list_req_ts = now_ts
-                            state.update({'mission_dl_active': True, 'mission_dl_total': 0, 'mission_dl_received': 0, 'mission_dl_done_ts': 0.0})
                             state.append_message("[Worker] AUTO mode: requesting mission list to compute progress")
                         except Exception:
                             last_auto_mission_list_req_ts = now_ts
@@ -1256,15 +1551,17 @@ def mavlink_worker(endpoint, state):
                             except Exception:
                                 history = []
                             pt = [float(data['lon']), float(data['lat'])]
+                            now_breadcrumb_ts = time.time()
                             if not history:
                                 history.append(pt)
+                                last_breadcrumb_ts = now_breadcrumb_ts
                             else:
                                 last = history[-1]
-                                if (
-                                    abs(float(last[0]) - pt[0]) > 1e-6
-                                    or abs(float(last[1]) - pt[1]) > 1e-6
-                                ):
+                                moved_m = _distance_m(float(last[0]), float(last[1]), pt[0], pt[1])
+                                dt_ok = (now_breadcrumb_ts - last_breadcrumb_ts) >= BREADCRUMB_MIN_DT_S
+                                if moved_m >= BREADCRUMB_MIN_STEP_M and dt_ok:
                                     history.append(pt)
+                                    last_breadcrumb_ts = now_breadcrumb_ts
                             if len(history) > 5000:
                                 history = history[-5000:]
                             data['history'] = history
@@ -1279,31 +1576,16 @@ def mavlink_worker(endpoint, state):
                         gps1_rtk_ok = int(getattr(msg, 'fix_type', 0) or 0) == 6
                     except Exception:
                         gps1_rtk_ok = False
-
-                    # Breadcrumbs (only when RTK Fixed is available on at least one GPS)
-                    breadcrumbs_enabled = bool(gps1_rtk_ok or gps2_rtk_ok)
-                    if (msg.lat != 0 and msg.lon != 0) and breadcrumbs_enabled:
-                            try:
-                                snap_hist = state.get().get('history') or []
-                                history = list(snap_hist)
-                            except Exception:
-                                history = []
-                            pt = [float(data['lon']), float(data['lat'])]
-                            if not history:
-                                history.append(pt)
-                            else:
-                                last = history[-1]
-                                if (
-                                    abs(float(last[0]) - pt[0]) > 1e-6
-                                    or abs(float(last[1]) - pt[1]) > 1e-6
-                                ):
-                                    history.append(pt)
-                            if len(history) > 5000:
-                                history = history[-5000:]
-                            data['history'] = history
+                    # Intentionally do not append breadcrumbs from GPS_RAW_INT.
+                    # Breadcrumb path should use only GLOBAL_POSITION_INT to avoid
+                    # alternating between fused and raw GPS positions (zig-zag trail).
 
                     data['gps1_fix'] = get_gps_fix_string(msg.fix_type)
                     data['satellites_visible'] = msg.satellites_visible
+                    try:
+                        data['gps1_h_acc_m'] = round(float(getattr(msg, 'h_acc', 0) or 0) / 1000.0, 2)
+                    except Exception:
+                        data['gps1_h_acc_m'] = None
 
                 elif mtype == 'MISSION_CURRENT':
                     seq = int(getattr(msg, 'seq', 0) or 0)
@@ -1340,6 +1622,30 @@ def mavlink_worker(endpoint, state):
 
                     data['gps2_fix'] = get_gps_fix_string(msg.fix_type)
                     data['gps2_satellites_visible'] = msg.satellites_visible
+                    try:
+                        data['gps2_h_acc_m'] = round(float(getattr(msg, 'h_acc', 0) or 0) / 1000.0, 2)
+                    except Exception:
+                        data['gps2_h_acc_m'] = None
+                    try:
+                        gps2_yaw_cdeg = getattr(msg, 'yaw', None)
+                        if gps2_yaw_cdeg is None:
+                            data['gps2_yaw_deg'] = None
+                        else:
+                            gps2_yaw_cdeg = int(gps2_yaw_cdeg)
+                            data['gps2_yaw_deg'] = None if gps2_yaw_cdeg == 65535 else round(gps2_yaw_cdeg / 100.0, 2)
+                    except Exception:
+                        data['gps2_yaw_deg'] = None
+
+                elif mtype == 'COMMAND_LONG':
+                    cmd_id = int(getattr(msg, 'command', -1))
+                    if cmd_id in {181, 182, 184}: # DO_SET_RELAY
+                        relay_idx = int(float(getattr(msg, 'param1', 0.0)))
+                        state_val = int(float(getattr(msg, 'param2', 0.0)))
+                        # Convert ap_relay_index back to RELAY_NUM (1-based)
+                        relay_num = relay_idx + 1
+                        current_relays = state.get().get("relays", {})
+                        current_relays[relay_num] = state_val != 0
+                        data["relays"] = current_relays
 
                 elif mtype == 'SYS_STATUS':
                     data['battery_v'] = msg.voltage_battery / 1000.0
@@ -1378,6 +1684,16 @@ def mavlink_worker(endpoint, state):
                     state.append_message(txt)
                     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [STATUSTEXT] setting {txt}")
                     
+                    lower_txt = txt.lower()
+                    if 'failsafe' in lower_txt:
+                        clearing = any(kw in lower_txt for kw in ['end', 'ended', 'recovered', 'cleared'])
+                        if clearing:
+                            data['failsafe_active'] = False
+                            data['failsafe_desc'] = ""
+                        else:
+                            data['failsafe_active'] = True
+                            data['failsafe_desc'] = txt
+
                     # # Auto-reset mission when complete
                     # if "Mission Complete" in txt:
                     #     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [SYSTEM] Mission Complete detected. Resetting WP to 0.")
@@ -1456,20 +1772,20 @@ def mavlink_worker(endpoint, state):
 
                     _mission_cache = {}
                     _mission_items_cache = {}
+                    _mission_requested = set()
                     _mission_total = msg.count
+                    mission_count_pending = False
                     state.update({'mission_dl_active': True, 'mission_dl_total': int(_mission_total), 'mission_dl_received': 0, 'mission_dl_done_ts': 0.0})
                     if DEBUG:
                         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: Received MISSION_COUNT {_mission_total}. Starting download.")
                     if _mission_total > 0:
                         mission_download_active = True
                         mission_next_seq = 0
-                        with state.acquire_mav_lock():
-                            conn.mav.mission_request_int_send(conn.target_system, conn.target_component, 0)
-                        mission_last_req_time = time.time()
-                        if DEBUG:
-                            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: Requested item 0.")
+                        _request_mission_window()
                     else:
                         # Handle empty mission
+                        mission_download_active = False
+                        _set_mission_transfer_telemetry_throttle(True)
                         state.update({'mission_points': []})
                         state.update({'mission_items': []})
                         state.append_message("Mission loaded: 0 points")
@@ -1531,18 +1847,20 @@ def mavlink_worker(endpoint, state):
                         state.update({'mission_dl_received': int(len(_mission_cache))})
                     except Exception:
                         pass
+                    _mission_requested.discard(int(msg.seq))
                     
                     if msg.seq == mission_next_seq:
                         mission_next_seq += 1
-                        
+                    while mission_next_seq in _mission_cache:
+                        mission_next_seq += 1
+
                     if mission_next_seq < _mission_total:
-                        with state.acquire_mav_lock():
-                            conn.mav.mission_request_int_send(conn.target_system, conn.target_component, mission_next_seq)
-                        mission_last_req_time = time.time()
-                        if DEBUG:
-                            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: Requested item {mission_next_seq}.")
+                        _request_mission_window()
                     elif mission_download_active:
                         mission_download_active = False
+                        mission_count_pending = False
+                        _mission_requested = set()
+                        _set_mission_transfer_telemetry_throttle(True)
                         sorted_pts = [v for k, v in sorted(_mission_cache.items())]
                         state.update({'mission_points': sorted_pts})
                         try:
@@ -1818,6 +2136,7 @@ def _map_signature(data: dict, map_style_name: str) -> tuple:
 
 # --- MAIN APP ---
 start_background_threads()
+start_telegram_bridge()
 # st_autorefresh removed in favor of while loop
 
 # NOTE: Sidebar UI is rendered via fragments later (see bottom of file).
@@ -1991,6 +2310,7 @@ def _render_live_sidebar():
     <b><u>GPS 1:</b>&nbsp;&nbsp;&nbsp;{current_data.get('gps1_fix')}</u><br>
     -<b>Lat:</b>&nbsp;&nbsp;&nbsp;{current_data.get('lat') or 'N/A'}<br>
     -<b>Lon:</b>&nbsp;{current_data.get('lon') or 'N/A'}<br>
+    -<b>Acc:</b>&nbsp;{format_gps_accuracy(current_data.get('gps1_h_acc_m'))}<br>
     -<b>Sats:</b>&nbsp;{current_data.get('satellites_visible')}
 </div>
 """
@@ -2001,6 +2321,8 @@ def _render_live_sidebar():
     <b><u>GPS 2:</b>&nbsp;&nbsp;&nbsp;{current_data.get('gps2_fix')}</u><br>
     -<b>Lat:</b>&nbsp;&nbsp;&nbsp;{current_data.get('gps2_lat') or 'N/A'}<br>
     -<b>Lon:</b>&nbsp;{current_data.get('gps2_lon') or 'N/A'}<br>
+    -<b>Acc:</b>&nbsp;{format_gps_accuracy(current_data.get('gps2_h_acc_m'))}<br>
+    -<b>Yaw:</b>&nbsp;{format_gps_yaw(current_data.get('gps2_yaw_deg'))}<br>
     -<b>Sats:</b>&nbsp;{current_data.get('gps2_satellites_visible')}
 </div>
 """

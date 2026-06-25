@@ -266,7 +266,24 @@ def get_mqtt_client() -> Optional[mqtt.Client]:
                 if raw == "":
                     return
 
-                val = float(raw)
+                val: Optional[float] = None
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    payload = None
+
+                if isinstance(payload, dict):
+                    val = _as_float(payload.get("temperature_f"))
+                    if val is None:
+                        val = _as_float(payload.get("temperature"))
+                    if val is None:
+                        val = _as_float(payload.get("value"))
+                elif payload is not None:
+                    val = _as_float(payload)
+
+                if val is None:
+                    val = float(raw)
+
                 get_shared_state().update({'mqtt_var1': float(val)})
                 #print(f"[MQTT] Received {val} on topic {msg.topic}")
             except Exception:

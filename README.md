@@ -165,6 +165,15 @@ Common .env values:
 - MAPBOX_API_KEY: required for Mapbox map tiles
 - DEBUG: set to 1 for verbose debug logging
 - RELAY1..RELAY6: optional relay toggle labels
+- MISSION_FETCH_METHOD: `mavlink` (default), `mavftp`, `mavsdk`, or `auto`
+	- `mavlink`: classic MISSION_COUNT / MISSION_ITEM flow (most compatible)
+	- `mavftp`: try reading mission file via MAVFTP only
+	- `auto`: try MAVFTP first, then fall back to MAVLink protocol
+- MISSION_UPLOAD_METHOD: `mavlink` (default), `mavftp`, or `auto`
+	- `mavlink`: classic one-item-at-a-time mission upload
+	- `mavftp`: upload mission file via MAVFTP only
+	- `auto`: try MAVFTP first, then fall back to MAVLink protocol
+- MAVFTP_MISSION_PATH / MAVFTP_UPLOAD_PATH: optional explicit remote mission file path override
 
 ## Running
 

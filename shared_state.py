@@ -16,10 +16,13 @@ class SharedState:
             'speed_ms': 0,
             'gps1_fix': 'No Fix',
             'satellites_visible': 0,
+            'gps1_h_acc_m': None,
             'gps2_fix': None,
             'gps2_satellites_visible': 0,
             'gps2_lat': None,
             'gps2_lon': None,
+            'gps2_h_acc_m': None,
+            'gps2_yaw_deg': None,
             'battery_v': 0,
             'battery_pct': 0,
             'messages': [],
@@ -59,6 +62,9 @@ class SharedState:
             'mission_ul_sent': 0,
             'mission_ul_done_ts': 0.0,
 
+            # Track relay states based on command interceptions and UI actions
+            'relays': {},
+
             # Backwards-compat UI flag used by some pages/buttons.
             'mission_loading': False,
         }
@@ -68,6 +74,7 @@ class SharedState:
         self.upload_queue = queue.Queue()
         self.mission_fetch_queue = queue.Queue()
         self.save_wp_queue = queue.Queue()
+        self.telegram_event_queue = queue.Queue()
         self.upload_status = {'status': 'idle', 'message': ''}
         self.current_worker_id = None
 
@@ -124,6 +131,14 @@ class SharedState:
             msgs.insert(0, msg_text)
             self.rover_data['messages'] = msgs[:15] # Keep last 15
             self.rover_data['last_update'] = time.time()
+            try:
+                self.telegram_event_queue.put_nowait({
+                    'type': 'message',
+                    'text': msg_text,
+                    'ts': self.rover_data['last_update'],
+                })
+            except Exception:
+                pass
 
     def get(self):
         with self.lock:
