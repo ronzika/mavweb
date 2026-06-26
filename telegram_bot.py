@@ -143,14 +143,32 @@ def _draw_local_map(snapshot: dict[str, Any]) -> bytes | None:
     min_lon, max_lon = min(lons), max(lons)
     min_lat, max_lat = min(lats), max(lats)
 
-    lon_span = max(max_lon - min_lon, 0.00008)
-    lat_span = max(max_lat - min_lat, 0.00008)
-    lon_pad = lon_span * 0.12
-    lat_pad = lat_span * 0.12
-    min_lon -= lon_pad
-    max_lon += lon_pad
-    min_lat -= lat_pad
-    max_lat += lat_pad
+    center_lon = (min_lon + max_lon) / 2
+    center_lat = (min_lat + max_lat) / 2
+    
+    base_lon_span = max(max_lon - min_lon, 0.00008) * 1.24
+    base_lat_span = max(max_lat - min_lat, 0.00008) * 1.24
+    
+    lon_scale = math.cos(math.radians(center_lat))
+    span_x = base_lon_span * lon_scale
+    span_y = base_lat_span
+    
+    canvas_w = width - 80
+    canvas_h = map_height - 80
+    canvas_ratio = canvas_w / canvas_h
+    
+    if span_x / span_y > canvas_ratio:
+        span_y = span_x / canvas_ratio
+    else:
+        span_x = span_y * canvas_ratio
+        
+    adj_lon_span = span_x / lon_scale
+    adj_lat_span = span_y
+    
+    min_lon = center_lon - adj_lon_span / 2
+    max_lon = center_lon + adj_lon_span / 2
+    min_lat = center_lat - adj_lat_span / 2
+    max_lat = center_lat + adj_lat_span / 2
 
     def to_xy(point_lon: float, point_lat: float) -> tuple[int, int]:
         x = int(round((point_lon - min_lon) / max(max_lon - min_lon, 1e-9) * (width - 80))) + 40
@@ -1015,6 +1033,7 @@ Speed    | {speed_ms:.2f} m/s
 
         history = _downsample_points(history, 120)
         mission_points = _downsample_points(mission_points, 120)
+        all_points = [(lon, lat)] + history + mission_points
 
         overlays: list[str] = []
         if len(history) > 1:
@@ -1036,10 +1055,18 @@ Speed    | {speed_ms:.2f} m/s
         overlays.append(f"pin-s+ff1744({lon:.7f},{lat:.7f})")
         overlay_part = ",".join(overlays)
         style = self.config.map_style or "satellite-streets-v12"
-        url = (
-            f"https://api.mapbox.com/styles/v1/mapbox/{style}/static/"
-            f"{overlay_part}/{lon:.7f},{lat:.7f},19/900x600@2x?access_token={urllib.parse.quote(self.config.mapbox_key)}"
-        )
+        
+        # Calculate optimal Mapbox bounds/scaling based on available points
+        if len(all_points) > 1:
+            url = (
+                f"https://api.mapbox.com/styles/v1/mapbox/{style}/static/"
+                f"{overlay_part}/auto/900x600@2x?padding=40,40,40,40&access_token={urllib.parse.quote(self.config.mapbox_key)}"
+            )
+        else:
+            url = (
+                f"https://api.mapbox.com/styles/v1/mapbox/{style}/static/"
+                f"{overlay_part}/{lon:.7f},{lat:.7f},19/900x600@2x?access_token={urllib.parse.quote(self.config.mapbox_key)}"
+            )
 
         if len(url) > 7500:
             history = _downsample_points(history, 60)
@@ -1061,10 +1088,16 @@ Speed    | {speed_ms:.2f} m/s
                     )
             overlays.append(f"pin-s+ff1744({lon:.7f},{lat:.7f})")
             overlay_part = ",".join(overlays)
-            url = (
-                f"https://api.mapbox.com/styles/v1/mapbox/{style}/static/"
-                f"{overlay_part}/{lon:.7f},{lat:.7f},19/900x600@2x?access_token={urllib.parse.quote(self.config.mapbox_key)}"
-            )
+            if len(all_points) > 1:
+                url = (
+                    f"https://api.mapbox.com/styles/v1/mapbox/{style}/static/"
+                    f"{overlay_part}/auto/900x600@2x?padding=40,40,40,40&access_token={urllib.parse.quote(self.config.mapbox_key)}"
+                )
+            else:
+                url = (
+                    f"https://api.mapbox.com/styles/v1/mapbox/{style}/static/"
+                    f"{overlay_part}/{lon:.7f},{lat:.7f},19/900x600@2x?access_token={urllib.parse.quote(self.config.mapbox_key)}"
+                )
 
         try:
             response = self.session.get(url, timeout=30)
