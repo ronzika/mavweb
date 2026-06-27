@@ -68,7 +68,7 @@ def _encode_polyline(points: Iterable[tuple[float, float]]) -> str:
     return "".join(result)
 
 
-def _downsample_points(points: list[list[float]], limit: int) -> list[list[float]]:
+def _downsample_points(points: list[tuple[float, float]], limit: int) -> list[tuple[float, float]]:
     if len(points) <= limit:
         return points
     step = max(1, math.ceil(len(points) / limit))
@@ -82,6 +82,44 @@ def _distance_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
     dlambda = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2)**2
     return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _map_center_zoom_from_points(
+    points: list[tuple[float, float]],
+    width: int,
+    height: int,
+    padding: int = 16,
+) -> tuple[float, float, float] | None:
+    if not points:
+        return None
+
+    lons = [p[0] for p in points]
+    lats = [p[1] for p in points]
+    min_lon, max_lon = min(lons), max(lons)
+    min_lat, max_lat = min(lats), max(lats)
+    center_lon = (min_lon + max_lon) / 2.0
+    center_lat = (min_lat + max_lat) / 2.0
+
+    if len(points) <= 1:
+        return center_lon, center_lat, 19.0
+
+    usable_w = max(1, width - (padding * 2))
+    usable_h = max(1, height - (padding * 2))
+    lon_span = max(max_lon - min_lon, 1e-7)
+
+    def _merc_y(lat: float) -> float:
+        lat = max(min(lat, 85.05112878), -85.05112878)
+        sin_lat = math.sin(math.radians(lat))
+        return 0.5 - (math.log((1.0 + sin_lat) / (1.0 - sin_lat)) / (4.0 * math.pi))
+
+    y_min = _merc_y(min_lat)
+    y_max = _merc_y(max_lat)
+    y_span = max(abs(y_max - y_min), 1e-9)
+
+    zoom_lon = math.log2((360.0 * usable_w) / (lon_span * 512.0))
+    zoom_lat = math.log2(usable_h / (y_span * 512.0))
+    zoom = max(0.0, min(22.0, min(zoom_lon, zoom_lat)))
+    return center_lon, center_lat, zoom
 
 def _mission_progress_snapshot(snapshot: dict[str, Any]) -> tuple[str, float | None]:
     total_wps = _safe_int(snapshot.get("mission_dl_total")) or 0
@@ -133,11 +171,16 @@ def _draw_local_map(snapshot: dict[str, Any]) -> bytes | None:
     width = 900
     map_height = 600
     banner_height = 92
+    # Keep local PNG styling aligned with Streamlit map semantics:
+    # - uniform path weights (trail/completed/pending)
+    # - waypoint markers sized larger than path width
+    path_width_px = 2
+    waypoint_radius_px = 6
     canvas = Image.new("RGBA", (width, map_height + banner_height), (8, 12, 18, 255))
     draw = ImageDraw.Draw(canvas)
 
-    # Determine the map bounds from available mission/history data so the view stays centered.
-    all_points = [(lon, lat)] + history + mission_points
+    # Constrain viewport to mission geometry (not breadcrumb drift) when mission points exist.
+    all_points = mission_points if mission_points else ([(lon, lat)] + history)
     lons = [p[0] for p in all_points]
     lats = [p[1] for p in all_points]
     min_lon, max_lon = min(lons), max(lons)
@@ -146,15 +189,20 @@ def _draw_local_map(snapshot: dict[str, Any]) -> bytes | None:
     center_lon = (min_lon + max_lon) / 2
     center_lat = (min_lat + max_lat) / 2
     
-    base_lon_span = max(max_lon - min_lon, 0.00008) * 1.24
-    base_lat_span = max(max_lat - min_lat, 0.00008) * 1.24
+    # Keep a small safety margin so markers and path strokes are not clipped,
+    # while still using most of the PNG map area.
+    margin_scale = 1.08
+    base_lon_span = max(max_lon - min_lon, 0.00006) * margin_scale
+    base_lat_span = max(max_lat - min_lat, 0.00006) * margin_scale
     
     lon_scale = math.cos(math.radians(center_lat))
     span_x = base_lon_span * lon_scale
     span_y = base_lat_span
     
-    canvas_w = width - 80
-    canvas_h = map_height - 80
+    map_pad_x = 18
+    map_pad_y = 18
+    canvas_w = width - (map_pad_x * 2)
+    canvas_h = map_height - (map_pad_y * 2)
     canvas_ratio = canvas_w / canvas_h
     
     if span_x / span_y > canvas_ratio:
@@ -171,17 +219,17 @@ def _draw_local_map(snapshot: dict[str, Any]) -> bytes | None:
     max_lat = center_lat + adj_lat_span / 2
 
     def to_xy(point_lon: float, point_lat: float) -> tuple[int, int]:
-        x = int(round((point_lon - min_lon) / max(max_lon - min_lon, 1e-9) * (width - 80))) + 40
-        y = int(round((max_lat - point_lat) / max(max_lat - min_lat, 1e-9) * (map_height - 80))) + 40
+        x = int(round((point_lon - min_lon) / max(max_lon - min_lon, 1e-9) * canvas_w)) + map_pad_x
+        y = int(round((max_lat - point_lat) / max(max_lat - min_lat, 1e-9) * canvas_h)) + map_pad_y
         return x, y
 
     # Map area background.
     draw.rectangle([0, 0, width, map_height], fill=(14, 20, 30, 255))
     grid_color = (34, 42, 54, 255)
-    for x in range(40, width - 39, 80):
-        draw.line([x, 30, x, map_height - 30], fill=grid_color, width=1)
-    for y in range(40, map_height - 39, 80):
-        draw.line([30, y, width - 30, y], fill=grid_color, width=1)
+    for x in range(map_pad_x, width - map_pad_x + 1, 80):
+        draw.line([x, map_pad_y, x, map_height - map_pad_y], fill=grid_color, width=1)
+    for y in range(map_pad_y, map_height - map_pad_y + 1, 80):
+        draw.line([map_pad_x, y, width - map_pad_x, y], fill=grid_color, width=1)
 
     # Mission path overlay.
     if len(mission_points) > 1:
@@ -189,20 +237,24 @@ def _draw_local_map(snapshot: dict[str, Any]) -> bytes | None:
         completed = mission_points[1:split_idx]
         pending = mission_points[max(1, split_idx - 1):]
         if len(completed) > 1:
-            draw.line([to_xy(lon_p, lat_p) for lon_p, lat_p in completed], fill=(0, 230, 118, 255), width=5)
+            draw.line([to_xy(lon_p, lat_p) for lon_p, lat_p in completed], fill=(0, 255, 0, 200), width=path_width_px)
         if len(pending) > 1:
-            draw.line([to_xy(lon_p, lat_p) for lon_p, lat_p in pending], fill=(245, 245, 245, 220), width=4)
+            draw.line([to_xy(lon_p, lat_p) for lon_p, lat_p in pending], fill=(255, 255, 255, 200), width=path_width_px)
 
     # Breadcrumb trail.
     if len(history) > 1:
-        draw.line([to_xy(lon_p, lat_p) for lon_p, lat_p in history], fill=(255, 235, 59, 255), width=4)
+        draw.line([to_xy(lon_p, lat_p) for lon_p, lat_p in history], fill=(255, 255, 0, 255), width=path_width_px)
 
     # Mission points and current rover marker.
     if mission_points:
         for idx, (lon_p, lat_p) in enumerate(mission_points[1:], start=1):
             x, y = to_xy(lon_p, lat_p)
-            color = (0, 230, 118, 255) if idx < wp_current else (245, 245, 245, 255)
-            draw.ellipse([x - 5, y - 5, x + 5, y + 5], fill=color, outline=(18, 24, 30, 255))
+            color = (0, 255, 0, 255) if idx < wp_current else (255, 255, 255, 255)
+            draw.ellipse(
+                [x - waypoint_radius_px, y - waypoint_radius_px, x + waypoint_radius_px, y + waypoint_radius_px],
+                fill=color,
+                outline=(18, 24, 30, 255),
+            )
 
     rover_x, rover_y = to_xy(lon, lat)
     draw.ellipse([rover_x - 8, rover_y - 8, rover_x + 8, rover_y + 8], fill=(255, 23, 68, 255), outline=(255, 255, 255, 255), width=2)
@@ -253,6 +305,7 @@ class TelegramBridge:
         self.chat_id = config.default_chat_id
         self.last_snapshot: dict[str, Any] | None = None
         self.dashboard_message_id: int | None = None
+        self.map_message_id: int | None = None
         self.last_dashboard_text: str | None = None
         self.threads: list[threading.Thread] = []
         self.poll_offset = 0
@@ -339,10 +392,10 @@ class TelegramBridge:
             logging.error(f"Telegram sendMessage exception: {exc}")
             return None
 
-    def edit_message_text(self, message_id: int, text: str, *, reply_markup: dict[str, Any] | None = None) -> None:
+    def edit_message_text(self, message_id: int, text: str, *, reply_markup: dict[str, Any] | None = None) -> bool:
         chat_id = self._get_chat_id()
         if chat_id is None:
-            return
+            return False
         payload: dict[str, Any] = {
             "chat_id": str(chat_id),
             "message_id": str(message_id),
@@ -353,8 +406,9 @@ class TelegramBridge:
             payload["reply_markup"] = json.dumps(reply_markup)
         try:
             self.session.post(self._api_url("editMessageText"), data=payload, timeout=20).raise_for_status()
+            return True
         except Exception:
-            pass
+            return False
 
     def send_location(self, lat: float, lon: float, *, silent: bool = True, accuracy: float | None = None) -> None:
         chat_id = self._get_chat_id()
@@ -373,10 +427,10 @@ class TelegramBridge:
         except Exception:
             pass
 
-    def send_photo(self, image_bytes: bytes, *, caption: str | None = None, silent: bool = True) -> None:
+    def send_photo(self, image_bytes: bytes, *, caption: str | None = None, silent: bool = True) -> dict[str, Any] | None:
         chat_id = self._get_chat_id()
         if chat_id is None:
-            return
+            return None
         data = {
             "chat_id": str(chat_id),
             "disable_notification": "true" if silent else "false",
@@ -385,9 +439,45 @@ class TelegramBridge:
             data["caption"] = caption
         files = {"photo": ("map.png", image_bytes, "image/png")}
         try:
-            self.session.post(self._api_url("sendPhoto"), data=data, files=files, timeout=30).raise_for_status()
+            response = self.session.post(self._api_url("sendPhoto"), data=data, files=files, timeout=30)
+            response.raise_for_status()
+            payload = response.json()
+            if not payload.get("ok", False):
+                return None
+            return payload
         except Exception:
-            pass
+            return None
+
+    def edit_photo_message(
+        self,
+        message_id: int,
+        image_bytes: bytes,
+        *,
+        caption: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> bool:
+        chat_id = self._get_chat_id()
+        if chat_id is None:
+            return False
+
+        media: dict[str, Any] = {
+            "type": "photo",
+            "media": "attach://photo",
+        }
+        if caption:
+            media["caption"] = caption
+
+        data: dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "message_id": str(message_id),
+            "media": json.dumps(media),
+        }
+        if reply_markup is not None:
+            data["reply_markup"] = json.dumps(reply_markup)
+
+        files = {"photo": ("map.png", image_bytes, "image/png")}
+        payload = self._request("editMessageMedia", data=data, files=files)
+        return bool(payload and payload.get("ok", False))
 
     def _event_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -415,21 +505,37 @@ class TelegramBridge:
             time.sleep(2.0)
 
     def _build_dashboard_text(self, snapshot: dict[str, Any]) -> str:
-        mode = snapshot.get("mode") or "UNKNOWN"
-        link_quality = snapshot.get("link_quality", 0)
+        mode = str(snapshot.get("mode") or "UNKNOWN")
+        link_quality = _safe_int(snapshot.get("link_quality"))
+        if link_quality is None:
+            link_quality = 0
         armed = "ARMED" if snapshot.get("armed") else "DISARMED"
         
-        gps1_fix = snapshot.get("gps1_fix", 0)
-        gps1_sats = snapshot.get("satellites_visible", 0)
-        gps2_fix = snapshot.get("gps2_fix", 0)
-        gps2_sats = snapshot.get("gps2_satellites_visible", 0)
+        gps1_fix = str(snapshot.get("gps1_fix", 0))
+        gps1_sats = _safe_int(snapshot.get("satellites_visible"))
+        gps2_fix = str(snapshot.get("gps2_fix", 0))
+        gps2_sats = _safe_int(snapshot.get("gps2_satellites_visible"))
+        if gps1_sats is None:
+            gps1_sats = 0
+        if gps2_sats is None:
+            gps2_sats = 0
         
-        battery_v = snapshot.get("battery_v", 0.0)
-        battery_pct = snapshot.get("battery_pct", 0)
-        speed_ms = snapshot.get("speed_ms", 0.0)
+        battery_v = _safe_float(snapshot.get("battery_v"))
+        battery_pct = _safe_int(snapshot.get("battery_pct"))
+        speed_ms = _safe_float(snapshot.get("speed_ms"))
+        if battery_v is None:
+            battery_v = 0.0
+        if battery_pct is None:
+            battery_pct = 0
+        if speed_ms is None:
+            speed_ms = 0.0
         
-        wp_current = snapshot.get("wp_current", 0)
-        total_wps = snapshot.get("mission_dl_total", 0)
+        wp_current = _safe_int(snapshot.get("wp_current"))
+        total_wps = _safe_int(snapshot.get("mission_dl_total"))
+        if wp_current is None:
+            wp_current = 0
+        if total_wps is None:
+            total_wps = 0
         mission_points = _safe_point_list(snapshot.get("mission_points") or [])
         if total_wps <= 0:
             if mission_points:
@@ -504,7 +610,10 @@ Speed    | {speed_ms:.2f} m/s
             [
                 {"text": "Reset Mission", "callback_data": "RESET_MISSION"},
                 {"text": "Clear Mission", "callback_data": "CLEAR_MISSION"},
-            ]
+            ],
+            [
+                {"text": "Refresh Map", "callback_data": "REFRESH_MAP"},
+            ],
         ]
         
         if self.relay_labels:
@@ -531,14 +640,25 @@ Speed    | {speed_ms:.2f} m/s
         last_keyboard = getattr(self, "last_dashboard_keyboard", None)
         
         if dash_text != self.last_dashboard_text or current_keyboard_json != last_keyboard:
-            self.edit_message_text(self.dashboard_message_id, dash_text, reply_markup=reply_markup)
-            self.last_dashboard_text = dash_text
-            self.last_dashboard_keyboard = current_keyboard_json
+            edited = self.edit_message_text(self.dashboard_message_id, dash_text, reply_markup=reply_markup)
+            if edited:
+                self.last_dashboard_text = dash_text
+                self.last_dashboard_keyboard = current_keyboard_json
+            else:
+                # Message can become stale after chat lifecycle changes; force re-create on next /dashboard.
+                self.dashboard_message_id = None
+                self.last_dashboard_text = None
+                self.last_dashboard_keyboard = None
 
     def _emit_snapshot_changes(self, previous: dict[str, Any], current: dict[str, Any]) -> None:
         if not previous.get("link_active") and current.get("link_active"):
             # Push a new dashboard when the rover connects
             self._cmd_dashboard()
+        elif previous.get("link_active") and not current.get("link_active"):
+            # Stop editing stale dashboard message across disconnects.
+            self.dashboard_message_id = None
+            self.last_dashboard_text = None
+            self.last_dashboard_keyboard = None
 
     def _poll_updates_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -629,7 +749,9 @@ Speed    | {speed_ms:.2f} m/s
         elif data == "SAVE_WP":
             self._cmd_save_wp()
         elif data == "REQUEST_MAP":
-            self._cmd_map()
+            self._cmd_map(in_place=True)
+        elif data == "REFRESH_MAP":
+            self._cmd_map(in_place=True)
         elif data.startswith("RELAY_SET_"):
             try:
                 parts = data.split("_")
@@ -665,7 +787,10 @@ Speed    | {speed_ms:.2f} m/s
 
         handler = handlers.get(command)
         if handler is not None:
-            handler()
+            try:
+                handler()
+            except Exception as exc:
+                self.send_message(f"Command failed: {command} ({exc})", silent=True)
         else:
             self.send_message(f"Unknown command: {command}", silent=True)
 
@@ -678,14 +803,21 @@ Speed    | {speed_ms:.2f} m/s
 
     def _cmd_dashboard(self) -> None:
         snapshot = self.state.get()
-        dash_text = self._build_dashboard_text(snapshot)
-        reply_markup = self._build_dashboard_keyboard(snapshot)
+        try:
+            dash_text = self._build_dashboard_text(snapshot)
+            reply_markup = self._build_dashboard_keyboard(snapshot)
+        except Exception:
+            self.send_message("Dashboard unavailable right now; state is refreshing. Try again in a moment.", silent=True)
+            return
         
         result = self.send_message(dash_text, silent=True, reply_markup=reply_markup, parse_mode="HTML")
         if result and result.get("ok"):
             self.dashboard_message_id = result.get("result", {}).get("message_id")
             self.last_dashboard_text = dash_text
             self.last_dashboard_keyboard = json.dumps(reply_markup, sort_keys=True)
+
+    def _cmd_skip(self) -> None:
+        self._cmd_change_wp(1)
 
     def _cmd_status(self) -> None:
         self.send_message(self._status_text(self.state.get()), silent=True)
@@ -698,7 +830,7 @@ Speed    | {speed_ms:.2f} m/s
         text = "Last messages (newest first):\n" + "\n".join(messages[:10])
         self.send_message(text[:3500], silent=True)
 
-    def _cmd_map(self) -> None:
+    def _cmd_map(self, in_place: bool = False) -> None:
         snapshot = self.state.get()
         lat = snapshot.get("lat")
         lon = snapshot.get("lon")
@@ -712,7 +844,16 @@ Speed    | {speed_ms:.2f} m/s
             return
 
         progress_text, _ = _mission_progress_snapshot(snapshot)
-        self.send_photo(image, caption=f"{float(lat):.6f}, {float(lon):.6f}\n{progress_text}", silent=True)
+        caption = f"{float(lat):.6f}, {float(lon):.6f}\n{progress_text}"
+
+        if in_place and self.map_message_id is not None:
+            edited = self.edit_photo_message(self.map_message_id, image, caption=caption)
+            if edited:
+                return
+
+        sent = self.send_photo(image, caption=caption, silent=True)
+        if sent and sent.get("ok"):
+            self.map_message_id = sent.get("result", {}).get("message_id")
 
     def _cmd_temp(self) -> None:
         snapshot = self.state.get()
@@ -897,7 +1038,22 @@ Speed    | {speed_ms:.2f} m/s
         if wp_current is None:
             self.send_message("Current waypoint unknown.", silent=True)
             return
-        self.state.save_wp_queue.put({"wp_current": int(wp_current), "ts": time.time()})
+        lat = snapshot.get("lat")
+        lon = snapshot.get("lon")
+        alt_m = snapshot.get("alt_m")
+        if lat is None or lon is None:
+            self.send_message("Current location unknown. Waiting for GPS…", silent=True)
+            return
+
+        self.state.save_wp_queue.put(
+            {
+                "wp_current": int(wp_current),
+                "ts": time.time(),
+                "lat": float(lat),
+                "lon": float(lon),
+                "alt_m": (float(alt_m) if alt_m is not None else None),
+            }
+        )
         self.send_message(f"Save waypoint requested for WP {int(wp_current)}.", silent=True)
 
     def _send_relay(self, relay_num: int, state: int) -> None:
@@ -1027,40 +1183,53 @@ Speed    | {speed_ms:.2f} m/s
         if not _is_valid_mapbox_key(self.config.mapbox_key):
             return local_image
 
-        history = list(snapshot.get("history") or [])
-        mission_points = list(snapshot.get("mission_points") or [])
+        history = _safe_point_list(snapshot.get("history") or [])
+        mission_points = _safe_point_list(snapshot.get("mission_points") or [])
         wp_current = int(snapshot.get("wp_current") or 0)
 
         history = _downsample_points(history, 120)
         mission_points = _downsample_points(mission_points, 120)
-        all_points = [(lon, lat)] + history + mission_points
+        bounds_points = mission_points if mission_points else ([(lon, lat)] + history)
 
         overlays: list[str] = []
         if len(history) > 1:
             history_polyline = _encode_polyline([(float(p[1]), float(p[0])) for p in history if len(p) >= 2])
-            overlays.append(f"path-3+ffeb3b-0.8({history_polyline})")
+            overlays.append(f"path-2+ffff00-1.0({history_polyline})")
 
         if len(mission_points) > 1:
             completed = mission_points[1:max(1, wp_current)]
             pending = mission_points[max(1, wp_current - 1):]
             if len(completed) > 1:
                 overlays.append(
-                    f"path-3+00ff00-0.8({_encode_polyline([(float(p[1]), float(p[0])) for p in completed if len(p) >= 2])})"
+                    f"path-2+00ff00-0.8({_encode_polyline([(float(p[1]), float(p[0])) for p in completed if len(p) >= 2])})"
                 )
             if len(pending) > 1:
                 overlays.append(
-                    f"path-3+ffffff-0.8({_encode_polyline([(float(p[1]), float(p[0])) for p in pending if len(p) >= 2])})"
+                    f"path-2+ffffff-0.8({_encode_polyline([(float(p[1]), float(p[0])) for p in pending if len(p) >= 2])})"
                 )
 
         overlays.append(f"pin-s+ff1744({lon:.7f},{lat:.7f})")
         overlay_part = ",".join(overlays)
         style = self.config.map_style or "satellite-streets-v12"
         
-        # Calculate optimal Mapbox bounds/scaling based on available points
-        if len(all_points) > 1:
+        # Constrain viewport to mission waypoints when available.
+        if mission_points:
+            center = _map_center_zoom_from_points(mission_points, width=900, height=600, padding=16)
+            if center is None:
+                url = (
+                    f"https://api.mapbox.com/styles/v1/mapbox/{style}/static/"
+                    f"{overlay_part}/{lon:.7f},{lat:.7f},19/900x600@2x?access_token={urllib.parse.quote(self.config.mapbox_key)}"
+                )
+            else:
+                center_lon, center_lat, zoom = center
+                url = (
+                    f"https://api.mapbox.com/styles/v1/mapbox/{style}/static/"
+                    f"{overlay_part}/{center_lon:.7f},{center_lat:.7f},{zoom:.2f}/900x600@2x?access_token={urllib.parse.quote(self.config.mapbox_key)}"
+                )
+        elif len(bounds_points) > 1:
             url = (
                 f"https://api.mapbox.com/styles/v1/mapbox/{style}/static/"
-                f"{overlay_part}/auto/900x600@2x?padding=40,40,40,40&access_token={urllib.parse.quote(self.config.mapbox_key)}"
+                f"{overlay_part}/auto/900x600@2x?padding=16,16,16,16&access_token={urllib.parse.quote(self.config.mapbox_key)}"
             )
         else:
             url = (
@@ -1074,24 +1243,37 @@ Speed    | {speed_ms:.2f} m/s
             overlays = []
             if len(history) > 1:
                 history_polyline = _encode_polyline([(float(p[1]), float(p[0])) for p in history if len(p) >= 2])
-                overlays.append(f"path-3+ffeb3b-0.8({history_polyline})")
+                overlays.append(f"path-2+ffff00-1.0({history_polyline})")
             if len(mission_points) > 1:
                 completed = mission_points[1:max(1, wp_current)]
                 pending = mission_points[max(1, wp_current - 1):]
                 if len(completed) > 1:
                     overlays.append(
-                        f"path-3+00ff00-0.8({_encode_polyline([(float(p[1]), float(p[0])) for p in completed if len(p) >= 2])})"
+                        f"path-2+00ff00-0.8({_encode_polyline([(float(p[1]), float(p[0])) for p in completed if len(p) >= 2])})"
                     )
                 if len(pending) > 1:
                     overlays.append(
-                        f"path-3+ffffff-0.8({_encode_polyline([(float(p[1]), float(p[0])) for p in pending if len(p) >= 2])})"
+                        f"path-2+ffffff-0.8({_encode_polyline([(float(p[1]), float(p[0])) for p in pending if len(p) >= 2])})"
                     )
             overlays.append(f"pin-s+ff1744({lon:.7f},{lat:.7f})")
             overlay_part = ",".join(overlays)
-            if len(all_points) > 1:
+            if mission_points:
+                center = _map_center_zoom_from_points(mission_points, width=900, height=600, padding=16)
+                if center is None:
+                    url = (
+                        f"https://api.mapbox.com/styles/v1/mapbox/{style}/static/"
+                        f"{overlay_part}/{lon:.7f},{lat:.7f},19/900x600@2x?access_token={urllib.parse.quote(self.config.mapbox_key)}"
+                    )
+                else:
+                    center_lon, center_lat, zoom = center
+                    url = (
+                        f"https://api.mapbox.com/styles/v1/mapbox/{style}/static/"
+                        f"{overlay_part}/{center_lon:.7f},{center_lat:.7f},{zoom:.2f}/900x600@2x?access_token={urllib.parse.quote(self.config.mapbox_key)}"
+                    )
+            elif len(bounds_points) > 1:
                 url = (
                     f"https://api.mapbox.com/styles/v1/mapbox/{style}/static/"
-                    f"{overlay_part}/auto/900x600@2x?padding=40,40,40,40&access_token={urllib.parse.quote(self.config.mapbox_key)}"
+                    f"{overlay_part}/auto/900x600@2x?padding=16,16,16,16&access_token={urllib.parse.quote(self.config.mapbox_key)}"
                 )
             else:
                 url = (

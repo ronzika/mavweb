@@ -7,7 +7,7 @@ services:
     container_name: mavweb
     ports:
       - "8500:8500"
-      - "14550:14550/udp"
+      - "14551:14551/udp"
     env_file:
       - .env
     volumes:
