@@ -40,6 +40,8 @@ class SharedState:
             # Used to disable UI actions that depend on a known current waypoint.
             'wp_current_known': False,
             'last_update': 0,
+            'last_vehicle_packet_ts': 0.0,
+            'last_vehicle_heartbeat_ts': 0.0,
             'link_quality': 100,
             'link_quality_history': [],
             'packets_received': 0,

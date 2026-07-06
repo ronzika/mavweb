@@ -3,13 +3,16 @@ from __future__ import annotations
 import html
 import io
 import dataclasses
+import inspect
 import json
 import math
 import os
 import queue
+import struct
 import threading
 import time
 import urllib.parse
+import wave
 from typing import Any, Iterable
 
 import requests
@@ -157,6 +160,20 @@ def _safe_point_list(points: Iterable[Any]) -> list[tuple[float, float]]:
     return result
 
 
+def _make_alert_tone_wav(duration_s: float = 0.6, freq_hz: float = 1050.0, sample_rate: int = 16000) -> bytes:
+    frame_count = max(1, int(duration_s * sample_rate))
+    max_amp = int(32767 * 0.35)
+    with io.BytesIO() as out:
+        with wave.open(out, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            for idx in range(frame_count):
+                sample = int(max_amp * math.sin((2.0 * math.pi * freq_hz * idx) / sample_rate))
+                wav_file.writeframes(struct.pack("<h", sample))
+        return out.getvalue()
+
+
 def _draw_local_map(snapshot: dict[str, Any]) -> bytes | None:
     lat = _safe_float(snapshot.get("lat"))
     lon = _safe_float(snapshot.get("lon"))
@@ -291,6 +308,7 @@ class TelegramConfig:
     token: str = ""
     default_chat_id: int | None = None
     disable_polling: bool = False
+    rc_save_wp_alert_enabled: bool = True
     mapbox_key: str = ""
     map_style: str = "satellite-streets-v12"
 
@@ -309,6 +327,14 @@ class TelegramBridge:
         self.last_dashboard_text: str | None = None
         self.threads: list[threading.Thread] = []
         self.poll_offset = 0
+        self.last_rc_save_wp_alert_ts = 0.0
+        self.last_api_ok_ts = 0.0
+        self.last_api_error_ts = 0.0
+        self.last_api_error = ""
+        self.last_poll_ok_ts = 0.0
+        self.last_poll_error_ts = 0.0
+        self.last_poll_error = ""
+        self.dashboard_recreate_after_ts = 0.0
         
         self.relay_labels: dict[int, str] = {
             i: (os.getenv(f"RELAY{i}", "") or "").strip()
@@ -348,6 +374,14 @@ class TelegramBridge:
     def _api_url(self, method: str) -> str:
         return f"https://api.telegram.org/bot{self.config.token}/{method}"
 
+    def _allow_standalone_text_message(self) -> bool:
+        # Keep Telegram chat noise low: allow standalone text only from map/dashboard handlers.
+        allowed_callers = {"_cmd_dashboard", "_cmd_map"}
+        for frame in inspect.stack()[1:8]:
+            if frame.function in allowed_callers:
+                return True
+        return False
+
     def _request(self, method: str, *, params: dict[str, Any] | None = None, data=None, files=None) -> dict[str, Any] | None:
         if not self.config.token:
             return None
@@ -356,12 +390,21 @@ class TelegramBridge:
             response.raise_for_status()
             payload = response.json()
             if not payload.get("ok", False):
+                self.last_api_error_ts = time.time()
+                self.last_api_error = f"{method}: not ok"
                 return None
+            self.last_api_ok_ts = time.time()
+            self.last_api_error = ""
             return payload
-        except Exception:
+        except Exception as exc:
+            self.last_api_error_ts = time.time()
+            self.last_api_error = f"{method}: {exc}"
             return None
 
     def send_message(self, text: str, *, silent: bool = True, reply_markup: dict[str, Any] | None = None, parse_mode: str | None = None) -> dict[str, Any] | None:
+        if not self._allow_standalone_text_message():
+            return None
+
         chat_id = self._get_chat_id()
         if chat_id is None:
             return None
@@ -392,6 +435,32 @@ class TelegramBridge:
             logging.error(f"Telegram sendMessage exception: {exc}")
             return None
 
+    def _send_message_unrestricted(self, text: str, *, silent: bool = True) -> dict[str, Any] | None:
+        chat_id = self._get_chat_id()
+        if chat_id is None:
+            return None
+        payload = {
+            "chat_id": str(chat_id),
+            "text": text,
+            "disable_notification": "true" if silent else "false",
+        }
+        return self._request("sendMessage", data=payload)
+
+    def send_audio_alert(self, audio_bytes: bytes, *, title: str = "Alert", silent: bool = False) -> bool:
+        chat_id = self._get_chat_id()
+        if chat_id is None:
+            return False
+        data = {
+            "chat_id": str(chat_id),
+            "title": title,
+            "disable_notification": "true" if silent else "false",
+        }
+        files = {
+            "audio": ("rc-save-waypoint-alert.wav", audio_bytes, "audio/wav"),
+        }
+        payload = self._request("sendAudio", data=data, files=files)
+        return bool(payload and payload.get("ok", False))
+
     def edit_message_text(self, message_id: int, text: str, *, reply_markup: dict[str, Any] | None = None) -> bool:
         chat_id = self._get_chat_id()
         if chat_id is None:
@@ -404,11 +473,8 @@ class TelegramBridge:
         }
         if reply_markup is not None:
             payload["reply_markup"] = json.dumps(reply_markup)
-        try:
-            self.session.post(self._api_url("editMessageText"), data=payload, timeout=20).raise_for_status()
-            return True
-        except Exception:
-            return False
+        response = self._request("editMessageText", data=payload)
+        return bool(response and response.get("ok", False))
 
     def send_location(self, lat: float, lon: float, *, silent: bool = True, accuracy: float | None = None) -> None:
         chat_id = self._get_chat_id()
@@ -486,8 +552,29 @@ class TelegramBridge:
             except queue.Empty:
                 continue
 
-            # Removed scrolling message updates to prevent chat clutter
-            pass
+            if not isinstance(event, dict):
+                continue
+
+            event_type = str(event.get("type") or "").strip().lower()
+            if event_type != "rc_save_wp":
+                continue
+
+            if not self.config.rc_save_wp_alert_enabled:
+                continue
+
+            now = time.time()
+            if (now - self.last_rc_save_wp_alert_ts) < 2.5:
+                continue
+            self.last_rc_save_wp_alert_ts = now
+
+            source_text = str(event.get("text") or "").strip()
+            tone = _make_alert_tone_wav()
+            self.send_audio_alert(tone, title="RC Save Waypoint", silent=False)
+
+            if source_text:
+                self._send_message_unrestricted(f"RC Save Waypoint detected.\n{source_text}", silent=False)
+            else:
+                self._send_message_unrestricted("RC Save Waypoint detected.", silent=False)
 
     def _snapshot_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -500,11 +587,13 @@ class TelegramBridge:
                 continue
 
             self._emit_snapshot_changes(self.last_snapshot, snapshot)
+            self._maybe_recreate_dashboard(snapshot)
             self._update_dashboard(snapshot)
             self.last_snapshot = snapshot
             time.sleep(2.0)
 
     def _build_dashboard_text(self, snapshot: dict[str, Any]) -> str:
+        now_ts = time.time()
         mode = str(snapshot.get("mode") or "UNKNOWN")
         link_quality = _safe_int(snapshot.get("link_quality"))
         if link_quality is None:
@@ -565,11 +654,29 @@ class TelegramBridge:
         fc_messages = [m for m in all_messages if "[Telegram]" not in m]
         messages = fc_messages[:5]
         msg_text = "\n".join(f"- {html.escape(m)}" for m in messages) if messages else "No recent messages"
+
+        last_packet_ts = _safe_float(snapshot.get("last_vehicle_packet_ts"))
+        if not last_packet_ts:
+            last_packet_ts = _safe_float(snapshot.get("last_update"))
+        telemetry_age = (now_ts - last_packet_ts) if last_packet_ts else float("inf")
+        if telemetry_age < 3.0:
+            telemetry_state = "ONLINE"
+        elif telemetry_age < 12.0:
+            telemetry_state = "DEGRADED"
+        else:
+            telemetry_state = "OFFLINE"
+
+        api_age = (now_ts - self.last_api_ok_ts) if self.last_api_ok_ts > 0 else float("inf")
+        api_state = "OK" if api_age < 60.0 else "STALE"
+        poll_age = (now_ts - self.last_poll_ok_ts) if self.last_poll_ok_ts > 0 else float("inf")
+        poll_state = "OK" if poll_age < 90.0 else "STALE"
+        conn_line = (
+            f"Conn     | Telemetry: {telemetry_state} ({telemetry_age:.1f}s)\n"
+            f"Telegram | API: {api_state} ({api_age:.1f}s), Poll: {poll_state} ({poll_age:.1f}s)"
+        )
         
-        return f"""<b>Rover Dashboard</b>
+        return f"""<b>Dashboard:</b>
 <pre>
-State    | Value
----------|-------------------
 Mode     | {html.escape(mode)}
 Link Q   | {link_quality}%
 Status   | {armed}
@@ -579,6 +686,7 @@ GPS 2    | Fix: {gps2_fix}, Sats: {gps2_sats}
 Battery  | {battery_v:.1f}V ({battery_pct}%)
 Waypoint | {wp_current} / {total_wps}{dist_str}
 Speed    | {speed_ms:.2f} m/s
+{conn_line}
 </pre>
 <b>Recent Messages:</b>
 {msg_text}"""
@@ -644,21 +752,29 @@ Speed    | {speed_ms:.2f} m/s
             if edited:
                 self.last_dashboard_text = dash_text
                 self.last_dashboard_keyboard = current_keyboard_json
+                self.dashboard_recreate_after_ts = 0.0
             else:
-                # Message can become stale after chat lifecycle changes; force re-create on next /dashboard.
+                # Message can become stale after chat lifecycle changes; schedule controlled re-create.
                 self.dashboard_message_id = None
                 self.last_dashboard_text = None
                 self.last_dashboard_keyboard = None
+                self.dashboard_recreate_after_ts = time.time() + 3.0
+
+    def _maybe_recreate_dashboard(self, snapshot: dict[str, Any]) -> None:
+        if self.dashboard_message_id is not None:
+            return
+        if not snapshot.get("link_active"):
+            return
+        if self.dashboard_recreate_after_ts <= 0.0:
+            return
+        if time.time() < self.dashboard_recreate_after_ts:
+            return
+        self._cmd_dashboard()
 
     def _emit_snapshot_changes(self, previous: dict[str, Any], current: dict[str, Any]) -> None:
         if not previous.get("link_active") and current.get("link_active"):
             # Push a new dashboard when the rover connects
             self._cmd_dashboard()
-        elif previous.get("link_active") and not current.get("link_active"):
-            # Stop editing stale dashboard message across disconnects.
-            self.dashboard_message_id = None
-            self.last_dashboard_text = None
-            self.last_dashboard_keyboard = None
 
     def _poll_updates_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -668,12 +784,19 @@ Speed    | {speed_ms:.2f} m/s
                 response.raise_for_status()
                 payload = response.json()
             except Exception:
+                self.last_poll_error_ts = time.time()
+                self.last_poll_error = "getUpdates request failed"
                 time.sleep(2.0)
                 continue
 
             if not payload.get("ok", False):
+                self.last_poll_error_ts = time.time()
+                self.last_poll_error = "getUpdates returned not ok"
                 time.sleep(2.0)
                 continue
+
+            self.last_poll_ok_ts = time.time()
+            self.last_poll_error = ""
 
             for update in payload.get("result", []):
                 try:
@@ -969,6 +1092,7 @@ Speed    | {speed_ms:.2f} m/s
                     conn.target_component,
                     0,
                 )
+            self.state.update({"history": []})
             self.state.append_message("[Telegram] Reset mission to WP 0")
             self.send_message("Mission reset to WP 0.", silent=False)
         except Exception as exc:
@@ -1003,6 +1127,7 @@ Speed    | {speed_ms:.2f} m/s
                     conn.target_system,
                     conn.target_component,
                 )
+            self.state.update({"history": []})
             self.state.append_message("[Telegram] Cleared all waypoints from flight controller")
             self.send_message("Mission cleared.", silent=False)
         except Exception as exc:
@@ -1328,6 +1453,7 @@ def _build_config() -> TelegramConfig:
         token=(os.getenv("TELEGRAM_BOT_TOKEN", "") or "").strip(),
         default_chat_id=_safe_int(os.getenv("TELEGRAM_CHAT_ID", "")),
         disable_polling=_env_bool("TELEGRAM_DISABLE_POLLING", False),
+        rc_save_wp_alert_enabled=_env_bool("TELEGRAM_RC_SAVE_WP_ALERT_ENABLED", True),
         mapbox_key=(os.getenv("MAPBOX_API_KEY", "") or "").strip(),
         map_style=(os.getenv("TELEGRAM_MAP_STYLE", "") or "satellite-streets-v12").strip() or "satellite-streets-v12",
     )

@@ -595,6 +595,7 @@ def _render_sidebar_controls():
                                 cmd_conn.target_component,
                                 0,
                             )
+                        get_shared_state().update({'history': []})
                         get_shared_state().append_message("[UI] Reset mission to WP 0")
                     except Exception as e:
                         get_shared_state().append_message(f"[UI] Failed to reset mission: {e}")
@@ -998,6 +999,8 @@ def mavlink_worker(endpoint, state):
     EWMA_ALPHA = 0.2
     STALE_DECAY_START_S = 2.0
     STALE_DECAY_PER_S = 20.0
+    LINK_DEGRADED_AFTER_S = 3.0
+    LINK_OFFLINE_AFTER_S = 12.0
     ewma_lq = 100.0
     last_packet_ts = time.time()
     last_decay_eval_ts = time.time()
@@ -1096,7 +1099,12 @@ def mavlink_worker(endpoint, state):
             conn.target_component = found_comp
             
             state.set_connection(conn)
-            state.update({'link_active': True})
+            now_link_ts = time.time()
+            state.update({
+                'link_active': True,
+                'last_vehicle_packet_ts': now_link_ts,
+                'last_vehicle_heartbeat_ts': now_link_ts,
+            })
             state.append_message(f"Link Established (Sys: {conn.target_system}, Comp: {conn.target_component})")
             
             # Request All Data Streams (Fallback)
@@ -1432,7 +1440,11 @@ def mavlink_worker(endpoint, state):
                             state.update(decay_data)
                     last_decay_eval_ts = now_ts
                     # Check for link timeout
-                    if time.time() - state.get()['last_update'] > 5:
+                    snap = state.get()
+                    last_packet_ts_seen = float(snap.get('last_vehicle_packet_ts') or 0.0)
+                    if last_packet_ts_seen <= 0.0:
+                        last_packet_ts_seen = float(snap.get('last_update') or 0.0)
+                    if last_packet_ts_seen > 0.0 and (now_ts - last_packet_ts_seen) > LINK_OFFLINE_AFTER_S:
                         state.update({'link_active': False})
                     continue
 
@@ -1444,7 +1456,10 @@ def mavlink_worker(endpoint, state):
                 last_packet_ts = now_ts
                 last_decay_eval_ts = now_ts
 
-                data = {'link_active': True}
+                data = {
+                    'link_active': True,
+                    'last_vehicle_packet_ts': now_ts,
+                }
 
                 # Link Quality Calculation
                 try:
@@ -1505,6 +1520,7 @@ def mavlink_worker(endpoint, state):
                     pass
 
                 if mtype == 'HEARTBEAT':
+                    data['last_vehicle_heartbeat_ts'] = now_ts
                     data['mode'] = get_mode_name(msg.custom_mode)
                     data['armed'] = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
 
@@ -1685,6 +1701,23 @@ def mavlink_worker(endpoint, state):
                     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [STATUSTEXT] setting {txt}")
                     
                     lower_txt = txt.lower()
+                    save_wp_markers = (
+                        'save waypoint',
+                        'saved waypoint',
+                        'save wp',
+                        'saved wp',
+                        'waypoint saved',
+                    )
+                    if any(marker in lower_txt for marker in save_wp_markers):
+                        try:
+                            state.telegram_event_queue.put_nowait({
+                                'type': 'rc_save_wp',
+                                'text': txt,
+                                'ts': time.time(),
+                            })
+                        except Exception:
+                            pass
+
                     if 'failsafe' in lower_txt:
                         clearing = any(kw in lower_txt for kw in ['end', 'ended', 'recovered', 'cleared'])
                         if clearing:
@@ -2215,19 +2248,26 @@ def _render_live_sidebar():
     current_data = get_shared_state().get()
 
     now_ts = time.time()
-    last_ts = float(current_data.get('last_update') or 0)
-    age_s = (now_ts - last_ts) if last_ts else 999.0
+    last_pkt_ts = float(current_data.get('last_vehicle_packet_ts') or 0)
+    if last_pkt_ts <= 0:
+        last_pkt_ts = float(current_data.get('last_update') or 0)
+    age_s = (now_ts - last_pkt_ts) if last_pkt_ts else 999.0
 
     # IMPORTANT: This fragment must be invoked inside `with st.sidebar:`.
     # Do NOT use `st.sidebar.*` or sidebar placeholders here.
 
     # Status
-    if current_data.get('link_active'):
+    if current_data.get('link_active') and age_s < 3.0:
         dbg_line = ""
         if DEBUG:
             dbg_line = f"<br><span style='font-size:0.75em; color:gray'>age={age_s:.1f}s</span>"
         st.markdown(
             f"✅ **ROVER ONLINE**{dbg_line}<br><span style='font-size:0.8em; color:gray'>Last Update: {datetime.datetime.now().strftime('%H:%M:%S')}</span>",
+            unsafe_allow_html=True,
+        )
+    elif current_data.get('link_active') and age_s < 12.0:
+        st.markdown(
+            f"⚠️ **LINK DEGRADED**<br><span style='font-size:0.75em; color:gray'>age={age_s:.1f}s</span>",
             unsafe_allow_html=True,
         )
     else:
