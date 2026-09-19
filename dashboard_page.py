@@ -1631,6 +1631,14 @@ def mavlink_worker(endpoint, state):
                     pass
 
                 if mtype == 'HEARTBEAT':
+                    # Mission Planner forwarding can include multiple heartbeat sources
+                    # (e.g., GCS). Only apply mode/armed updates from the connected
+                    # vehicle target to avoid UI arm-state flapping.
+                    src_sys = msg.get_srcSystem()
+                    src_comp = msg.get_srcComponent()
+                    if src_sys != conn.target_system or src_comp != conn.target_component:
+                        continue
+
                     data['last_vehicle_heartbeat_ts'] = now_ts
                     data['mode'] = get_mode_name(msg.custom_mode)
                     data['armed'] = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
