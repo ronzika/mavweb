@@ -6,6 +6,7 @@ st.set_page_config(page_title="Rover GCS", layout="wide", initial_sidebar_state=
 pages = {
     "MavWeb GCS": [
         st.Page("dashboard_page.py", title="Dashboard", icon=":material/home:", default=True),
+        st.Page("pid_tuning.py", title="PID Tuning", icon=":material/tune:"),
         st.Page("mission.py", title="Mission", icon=":material/moving:",),
         st.Page("settings.py", title="Settings", icon=":material/settings:",),
     ]

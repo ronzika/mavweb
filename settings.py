@@ -19,6 +19,11 @@ def load_env_vars():
                 if '=' in line:
                     k, v = line.split('=', 1)
                     env_vars[k] = v
+
+    # Ensure PID tuning / LLM integration keys are always configurable.
+    env_vars.setdefault('OPENROUTER_API_KEY', '')
+    env_vars.setdefault('OPENROUTER_MODEL', 'openai/gpt-4o-mini')
+    env_vars.setdefault('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1')
     return env_vars
 
 def save_env_vars(new_vars):
@@ -37,7 +42,8 @@ with st.form('env_form'):
     new_vars = {}
     for k in sorted(env_vars.keys()):
         v = env_vars[k]
-        new_vars[k] = st.text_input(k, value=current[k], key=f'env_{k}')
+        input_type = 'password' if 'KEY' in k else 'default'
+        new_vars[k] = st.text_input(k, value=current[k], key=f'env_{k}', type=input_type)
     submitted = st.form_submit_button('Save')
     if submitted:
         save_env_vars(new_vars)

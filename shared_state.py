@@ -54,6 +54,27 @@ class SharedState:
             'mqtt_var1': 0, # planning to pull from mqtt. RPi temp sensor posts the data to mqtt
             'mqtt_var2': 0, 
 
+            # PID tuning live values and capture session state.
+            'pid_steering_desired': None,
+            'pid_steering_achieved': None,
+            'pid_speed_desired': None,
+            'pid_speed_achieved': None,
+            'pid_steering_error': None,
+            'pid_speed_error': None,
+            'pid_signal_source': 'unknown',
+            'pid_recording_active': False,
+            'pid_recording_started_ts': 0.0,
+            'pid_recording_stopped_ts': 0.0,
+            'pid_samples': [],
+            'pid_max_samples': 4000,
+            'pid_last_sample_ts': 0.0,
+
+            # Flight controller parameter cache + op status.
+            'param_cache': {},
+            'param_total_count': 0,
+            'param_last_refresh_ts': 0.0,
+            'param_last_op': {'status': 'idle', 'message': ''},
+
             # Mission transfer progress (batch operation UX)
             'mission_dl_active': False,
             'mission_dl_total': 0,
@@ -76,6 +97,7 @@ class SharedState:
         self.upload_queue = queue.Queue()
         self.mission_fetch_queue = queue.Queue()
         self.save_wp_queue = queue.Queue()
+        self.param_op_queue = queue.Queue()
         self.telegram_event_queue = queue.Queue()
         self.upload_status = {'status': 'idle', 'message': ''}
         self.current_worker_id = None

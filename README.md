@@ -103,6 +103,28 @@ Mission map rendering without a fetch:
 
 - When you upload a mission to the FC from this UI, the app also publishes the mission geometry into shared state so the main map can render it immediately without needing to fetch it back from the vehicle.
 
+## PID Tuning Page
+
+The PID Tuning page provides a focused workflow for rover tuning sessions.
+
+Features:
+
+- Live graphing of desired vs achieved steering and speed loops
+- Explicit Start/Stop recording controls for tuning sessions
+- CSV export of recorded samples
+- Flight controller parameter fetch/write for selected rover tuning groups
+- Safety guardrails on writes:
+	- disarmed-only writes
+	- write confirmation with old/new diff
+	- configured min/max range checks
+- Direct CSV submission to an LLM using OpenRouter (OpenAI-compatible API)
+- Inline analysis display and markdown download of results
+
+Notes on PID signal source:
+
+- The app prefers direct desired/achieved MAVLink signals when available.
+- If direct desired signals are not present, it falls back to actuator-output proxies and labels the source accordingly.
+
 ## Relay Setup
 
 Relays are enabled by setting environment variables in your .env file:
@@ -174,6 +196,9 @@ Common .env values:
 	- `mavftp`: upload mission file via MAVFTP only
 	- `auto`: try MAVFTP first, then fall back to MAVLink protocol
 - MAVFTP_MISSION_PATH / MAVFTP_UPLOAD_PATH: optional explicit remote mission file path override
+- OPENROUTER_API_KEY: API key for direct in-app LLM submission
+- OPENROUTER_MODEL: model ID passed to OpenRouter chat/completions
+- OPENROUTER_BASE_URL: API base URL (default: https://openrouter.ai/api/v1)
 
 ## Running
 

@@ -185,6 +185,7 @@ TELEMETRY_MESSAGE_INTERVALS: list[tuple[int, float]] = [
     (mavutil.mavlink.MAVLINK_MSG_ID_MISSION_CURRENT, 2),
     (mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD, 2),
     (mavutil.mavlink.MAVLINK_MSG_ID_GPS2_RAW, 1),
+    (mavutil.mavlink.MAVLINK_MSG_ID_PID_TUNING, 8),
 ]
 
 
@@ -1029,6 +1030,55 @@ def mavlink_worker(endpoint, state):
     BREADCRUMB_MIN_STEP_M = 0.8
     BREADCRUMB_MIN_DT_S = 0.35
 
+    # PID capture tracking from PID_TUNING only.
+    pid_last_tuning_steering_desired = None
+    pid_last_tuning_steering_achieved = None
+    pid_last_tuning_speed_desired = None
+    pid_last_tuning_speed_achieved = None
+    pid_sample_period_s = 0.2
+    last_pid_sample_ts = 0.0
+
+    def _decode_param_id(raw_id) -> str:
+        try:
+            if isinstance(raw_id, (bytes, bytearray)):
+                return raw_id.decode("utf-8", errors="ignore").rstrip("\x00")
+            return str(raw_id or "").rstrip("\x00")
+        except Exception:
+            return ""
+
+    def _append_pid_sample(sample: dict):
+        try:
+            snap = state.get()
+            max_len = int(snap.get('pid_max_samples') or 4000)
+            max_len = max(100, min(max_len, 20000))
+            samples = list(snap.get('pid_samples') or [])
+            samples.append(sample)
+            if len(samples) > max_len:
+                samples = samples[-max_len:]
+            state.update({
+                'pid_samples': samples,
+                'pid_last_sample_ts': float(sample.get('timestamp') or time.time()),
+            })
+        except Exception:
+            pass
+
+    def _resolve_pid_mask_metrics(cur: dict) -> tuple[int | None, bool, bool]:
+        try:
+            cache = dict(cur.get('param_cache') or {})
+        except Exception:
+            cache = {}
+
+        entry = cache.get('GCS_PID_MASK') if isinstance(cache, dict) else None
+        raw_value = entry.get('value') if isinstance(entry, dict) else None
+        try:
+            mask_value = int(float(raw_value))
+        except Exception:
+            return None, False, False
+
+        steer_enabled = bool(mask_value & 1)  # Rover bit 0: Steering
+        speed_enabled = bool(mask_value & 2)  # Rover bit 1: Throttle/Speed
+        return mask_value, steer_enabled, speed_enabled
+
     def _distance_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
         # Haversine distance in meters for small-step breadcrumb filtering.
         r = 6378137.0
@@ -1061,6 +1111,11 @@ def mavlink_worker(endpoint, state):
 
         gps1_rtk_ok = False
         gps2_rtk_ok = False
+        pid_last_tuning_steering_desired = None
+        pid_last_tuning_steering_achieved = None
+        pid_last_tuning_speed_desired = None
+        pid_last_tuning_speed_achieved = None
+        last_pid_sample_ts = 0.0
         
         try:
             state.append_message(f"Attempting MAVLink: {endpoint}")
@@ -1116,6 +1171,20 @@ def mavlink_worker(endpoint, state):
             # Request Specific Data Streams
             for msg_id, hz in TELEMETRY_MESSAGE_INTERVALS:
                 request_message_interval(conn, msg_id, hz)
+
+            # Prime mask-gated PID recording by fetching GCS_PID_MASK once on connect.
+            try:
+                pname = b'GCS_PID_MASK'
+                pname += b'\x00' * (16 - len(pname))
+                with state.acquire_mav_lock():
+                    conn.mav.param_request_read_send(
+                        conn.target_system,
+                        conn.target_component,
+                        pname,
+                        -1,
+                    )
+            except Exception:
+                pass
 
             def _set_mission_transfer_telemetry_throttle(enabled: bool):
                 """Reduce telemetry during mission transfers to prioritize MISSION_* traffic."""
@@ -1420,6 +1489,48 @@ def mavlink_worker(endpoint, state):
                         _mission_requested = set()
                         _set_mission_transfer_telemetry_throttle(True)
 
+                # Handle queued parameter operations from UI pages.
+                try:
+                    while not state.param_op_queue.empty():
+                        op = state.param_op_queue.get_nowait() or {}
+                        action = str(op.get('action') or '').strip().lower()
+                        if action == 'request_list':
+                            with state.acquire_mav_lock():
+                                conn.mav.param_request_list_send(conn.target_system, conn.target_component)
+                            state.update({'param_last_op': {'status': 'ok', 'message': 'Requested parameter list'}})
+                        elif action == 'request_param':
+                            raw_name = str(op.get('name') or '').strip()
+                            if raw_name:
+                                enc_name = raw_name.encode('utf-8')[:16]
+                                enc_name += b'\x00' * (16 - len(enc_name))
+                                with state.acquire_mav_lock():
+                                    conn.mav.param_request_read_send(
+                                        conn.target_system,
+                                        conn.target_component,
+                                        enc_name,
+                                        -1,
+                                    )
+                                state.update({'param_last_op': {'status': 'ok', 'message': f'Requested {raw_name}'}})
+                        elif action == 'set_param':
+                            raw_name = str(op.get('name') or '').strip()
+                            raw_value = op.get('value', None)
+                            param_type = int(op.get('param_type') or mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+                            if raw_name and raw_value is not None:
+                                send_value = float(raw_value)
+                                enc_name = raw_name.encode('utf-8')[:16]
+                                enc_name += b'\x00' * (16 - len(enc_name))
+                                with state.acquire_mav_lock():
+                                    conn.mav.param_set_send(
+                                        conn.target_system,
+                                        conn.target_component,
+                                        enc_name,
+                                        send_value,
+                                        param_type,
+                                    )
+                                state.update({'param_last_op': {'status': 'ok', 'message': f'Sent {raw_name}={send_value}'}})
+                except Exception as op_err:
+                    state.update({'param_last_op': {'status': 'error', 'message': f'Param op failed: {op_err}'}})
+
                 msg = conn.recv_match(blocking=True, timeout=WORKER_RECV_TIMEOUT_S)
                 if not msg:
                     now_ts = time.time()
@@ -1671,6 +1782,54 @@ def mavlink_worker(endpoint, state):
                     data['speed_ms'] = round(msg.groundspeed, 2)
                     data['heading_deg'] = msg.heading
 
+                elif mtype == 'PID_TUNING':
+                    try:
+                        axis = int(getattr(msg, 'axis', -1) or -1)
+                        steer_axis = int(getattr(mavutil.mavlink, 'PID_TUNING_STEER', -1) or -1)
+                        speed_axis = int(getattr(mavutil.mavlink, 'PID_TUNING_ACCZ', -1) or -1)
+                        if steer_axis >= 0 and axis == steer_axis:
+                            raw_desired = getattr(msg, 'desired', None)
+                            if raw_desired is None:
+                                raw_desired = getattr(msg, 'target', 0.0)
+                            raw_achieved = getattr(msg, 'achieved', None)
+                            if raw_achieved is None:
+                                raw_achieved = getattr(msg, 'actual', 0.0)
+                            pid_last_tuning_steering_achieved = float(raw_achieved or 0.0)
+                            pid_last_tuning_steering_desired = float(raw_desired or 0.0)
+                            data['pid_steering_desired'] = round(pid_last_tuning_steering_desired, 4)
+                            data['pid_steering_achieved'] = round(pid_last_tuning_steering_achieved, 4)
+                            data['pid_signal_source'] = 'pid_tuning'
+                        if speed_axis >= 0 and axis == speed_axis:
+                            raw_desired = getattr(msg, 'desired', None)
+                            if raw_desired is None:
+                                raw_desired = getattr(msg, 'target', 0.0)
+                            pid_last_tuning_speed_desired = float(raw_desired or 0.0)
+                            raw_achieved = getattr(msg, 'achieved', None)
+                            if raw_achieved is None:
+                                raw_achieved = getattr(msg, 'actual', 0.0)
+                            pid_last_tuning_speed_achieved = float(raw_achieved or 0.0)
+                            data['pid_speed_desired'] = round(pid_last_tuning_speed_desired, 4)
+                            data['pid_speed_achieved'] = round(pid_last_tuning_speed_achieved, 4)
+                            data['pid_signal_source'] = 'pid_tuning'
+                    except Exception:
+                        pass
+
+                elif mtype == 'PARAM_VALUE':
+                    pname = _decode_param_id(getattr(msg, 'param_id', ''))
+                    if pname:
+                        snap = state.get()
+                        cache = dict(snap.get('param_cache') or {})
+                        cache[pname] = {
+                            'value': float(getattr(msg, 'param_value', 0.0) or 0.0),
+                            'type': int(getattr(msg, 'param_type', mavutil.mavlink.MAV_PARAM_TYPE_REAL32) or mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+                            'index': int(getattr(msg, 'param_index', -1) or -1),
+                            'count': int(getattr(msg, 'param_count', 0) or 0),
+                            'updated_ts': time.time(),
+                        }
+                        data['param_cache'] = cache
+                        data['param_total_count'] = int(getattr(msg, 'param_count', 0) or 0)
+                        data['param_last_refresh_ts'] = time.time()
+
                 elif mtype == 'RADIO_STATUS':
                     try:
                         data['radio_rssi'] = int(getattr(msg, 'rssi', 0) or 0)
@@ -1908,6 +2067,81 @@ def mavlink_worker(endpoint, state):
                         if DEBUG:
                             print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [DEBUG {threading.get_ident()}] Worker: Download complete. Updated state with {len(sorted_pts)} points. Sent ACK.")
 
+                # Keep PID desired/achieved values coherent and record samples while active.
+                try:
+                    cur = state.get()
+                    gcs_pid_mask_val, allow_steering_metric, allow_speed_metric = _resolve_pid_mask_metrics(cur)
+
+                    speed_des = data.get('pid_speed_desired', cur.get('pid_speed_desired'))
+                    speed_ach = data.get('pid_speed_achieved', cur.get('pid_speed_achieved'))
+                    steer_ach = data.get('pid_steering_achieved', cur.get('pid_steering_achieved'))
+                    steer_des = data.get('pid_steering_desired', cur.get('pid_steering_desired'))
+                    if pid_last_tuning_steering_desired is not None:
+                        steer_des = float(pid_last_tuning_steering_desired)
+                        data['pid_signal_source'] = 'pid_tuning'
+                    if pid_last_tuning_steering_achieved is not None:
+                        steer_ach = float(pid_last_tuning_steering_achieved)
+                        data['pid_signal_source'] = 'pid_tuning'
+                    if pid_last_tuning_speed_desired is not None:
+                        speed_des = float(pid_last_tuning_speed_desired)
+                        data['pid_signal_source'] = 'pid_tuning'
+                    if pid_last_tuning_speed_achieved is not None:
+                        speed_ach = float(pid_last_tuning_speed_achieved)
+                        data['pid_signal_source'] = 'pid_tuning'
+
+                    if steer_des is not None:
+                        data['pid_steering_desired'] = round(float(steer_des), 4)
+                    if steer_ach is not None:
+                        data['pid_steering_achieved'] = round(float(steer_ach), 4)
+                    if speed_des is not None:
+                        data['pid_speed_desired'] = round(float(speed_des), 4)
+                    if speed_ach is not None:
+                        data['pid_speed_achieved'] = round(float(speed_ach), 4)
+
+                    if (steer_des is not None) and (steer_ach is not None):
+                        data['pid_steering_error'] = round(float(steer_des) - float(steer_ach), 4)
+                    if (speed_des is not None) and (speed_ach is not None):
+                        data['pid_speed_error'] = round(float(speed_des) - float(speed_ach), 4)
+
+                    recording_active = bool(cur.get('pid_recording_active'))
+                    now_capture_ts = time.time()
+                    if recording_active and (now_capture_ts - last_pid_sample_ts) >= pid_sample_period_s:
+                        if not (allow_steering_metric or allow_speed_metric):
+                            last_pid_sample_ts = now_capture_ts
+                            continue
+
+                        sample = {
+                            'timestamp': now_capture_ts,
+                            'mode': str(cur.get('mode') or ''),
+                            'armed': bool(cur.get('armed')),
+                            'gps_fix': str(cur.get('gps1_fix') or ''),
+                            'link_quality': int(cur.get('link_quality') or 0),
+                            'steering_desired': (
+                                data.get('pid_steering_desired', cur.get('pid_steering_desired')) if allow_steering_metric else None
+                            ),
+                            'steering_achieved': (
+                                data.get('pid_steering_achieved', cur.get('pid_steering_achieved')) if allow_steering_metric else None
+                            ),
+                            'steering_error': (
+                                data.get('pid_steering_error', cur.get('pid_steering_error')) if allow_steering_metric else None
+                            ),
+                            'speed_desired': (
+                                data.get('pid_speed_desired', cur.get('pid_speed_desired')) if allow_speed_metric else None
+                            ),
+                            'speed_achieved': (
+                                data.get('pid_speed_achieved', cur.get('pid_speed_achieved')) if allow_speed_metric else None
+                            ),
+                            'speed_error': (
+                                data.get('pid_speed_error', cur.get('pid_speed_error')) if allow_speed_metric else None
+                            ),
+                            'signal_source': data.get('pid_signal_source', cur.get('pid_signal_source', 'unknown')),
+                            'gcs_pid_mask': gcs_pid_mask_val,
+                        }
+                        _append_pid_sample(sample)
+                        last_pid_sample_ts = now_capture_ts
+                except Exception:
+                    pass
+
                 if data:
                     state.update(data)
 
@@ -1927,6 +2161,14 @@ def start_background_threads():
         daemon=True
     )
     t.start()
+    return True
+
+
+@st.cache_resource
+def ensure_runtime_started():
+    """Start singleton background services used across pages."""
+    start_background_threads()
+    start_telegram_bridge()
     return True
 
 # --- Helper Functions ---
@@ -2167,184 +2409,172 @@ def _map_signature(data: dict, map_style_name: str) -> tuple:
         history_sig,
     )
 
-# --- MAIN APP ---
-start_background_threads()
-start_telegram_bridge()
-# st_autorefresh removed in favor of while loop
+def render_dashboard_page():
+    # --- MAIN APP ---
+    ensure_runtime_started()
 
-# NOTE: Sidebar UI is rendered via fragments later (see bottom of file).
+    # NOTE: Sidebar UI is rendered via fragments later (see bottom of file).
 
-# Custom CSS for Metrics
-st.markdown("""
-    <style>
-    [data-testid="stMetric"] {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        text-align: center;
-    }
-    [data-testid="stMetricLabel"] {
-        font-size: 1rem !important;
-        width: 100%;
-        justify-content: center;
-        display: flex;
-    }
-    [data-testid="stMetricValue"] {
-        font-size: 1.5rem !important;
-        width: 100%;
-        justify-content: center;
-        display: flex;
-    }
-    </style>
-    """, unsafe_allow_html=True)
+    # Custom CSS for Metrics
+    st.markdown("""
+        <style>
+        [data-testid="stMetric"] {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: center;
+        }
+        [data-testid="stMetricLabel"] {
+            font-size: 1rem !important;
+            width: 100%;
+            justify-content: center;
+            display: flex;
+        }
+        [data-testid="stMetricValue"] {
+            font-size: 1.5rem !important;
+            width: 100%;
+            justify-content: center;
+            display: flex;
+        }
+        </style>
+        """, unsafe_allow_html=True)
 
-# white line separators
-st.markdown('<hr style="border:0;border-top:2px solid #fff;margin:8px 0 8px 0;">', unsafe_allow_html=True)
+    # white line separators
+    st.markdown('<hr style="border:0;border-top:2px solid #fff;margin:8px 0 8px 0;">', unsafe_allow_html=True)
 
-# Horizontal Telemetry Header Placeholders
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-metric_mode = c1.empty()
-metric_armed = c2.empty()
-metric_speed = c3.empty()
-metric_gps = c4.empty()
-metric_battery = c5.empty()
-metric_wp = c6.empty()
+    # Horizontal Telemetry Header Placeholders
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    metric_mode = c1.empty()
+    metric_armed = c2.empty()
+    metric_speed = c3.empty()
+    metric_gps = c4.empty()
+    metric_battery = c5.empty()
+    metric_wp = c6.empty()
 
-st.markdown('<hr style="border:0;border-top:2px solid #fff;margin:8px 0 8px 0;">', unsafe_allow_html=True)
+    st.markdown('<hr style="border:0;border-top:2px solid #fff;margin:8px 0 8px 0;">', unsafe_allow_html=True)
 
-# Mission Progress Placeholder (above map)
-mission_progress_placeholder = st.empty()
+    # Mission Progress Placeholder (above map)
+    mission_progress_placeholder = st.empty()
 
-# Map Placeholder
-map_placeholder = st.empty()
+    # Map Placeholder
+    map_placeholder = st.empty()
 
-st.markdown('<hr style="border:0;border-top:2px solid #fff;margin:8px 0 8px 0;">', unsafe_allow_html=True)
+    st.markdown('<hr style="border:0;border-top:2px solid #fff;margin:8px 0 8px 0;">', unsafe_allow_html=True)
 
-# System Console Placeholder
-st.markdown("**System Messages**")
-console_placeholder = st.empty()
+    # System Console Placeholder
+    st.markdown("**System Messages**")
+    console_placeholder = st.empty()
 
-if 'history' not in st.session_state:
-    st.session_state.history = []
+    if 'history' not in st.session_state:
+        st.session_state.history = []
 
-print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] Starting main update loop...")
-# --- Live UI (no full-page rerun loop) ---
-#
-# Using st.fragment lets Streamlit re-run ONLY this section on a timer.
-# That avoids full-page flicker and reduces map remount/redraw.
-@st.fragment(run_every=0.5)
-def _render_live_metrics():
-    current_data = get_shared_state().get()
-    metric_mode.metric("Mode", current_data.get('mode'))
-    metric_armed.metric("Armed", "ARMED" if current_data.get('armed') else "DISARMED")
-    metric_speed.metric("Speed", f"{current_data.get('speed_ms')} m/s")
-    metric_gps.metric("GPS", current_data.get('gps1_fix'))
-    metric_battery.metric("Battery", f"{current_data.get('battery_v')}V")
-    metric_wp.metric("WP", f"{current_data.get('wp_current', 0)}")
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] Starting main update loop...")
 
+    @st.fragment(run_every=0.5)
+    def _render_live_metrics():
+        current_data = get_shared_state().get()
+        metric_mode.metric("Mode", current_data.get('mode'))
+        metric_armed.metric("Armed", "ARMED" if current_data.get('armed') else "DISARMED")
+        metric_speed.metric("Speed", f"{current_data.get('speed_ms')} m/s")
+        metric_gps.metric("GPS", current_data.get('gps1_fix'))
+        metric_battery.metric("Battery", f"{current_data.get('battery_v')}V")
+        metric_wp.metric("WP", f"{current_data.get('wp_current', 0)}")
 
-@st.fragment(run_every=0.5)
-def _render_live_sidebar():
-    current_data = get_shared_state().get()
+    @st.fragment(run_every=0.5)
+    def _render_live_sidebar():
+        current_data = get_shared_state().get()
 
-    now_ts = time.time()
-    last_pkt_ts = float(current_data.get('last_vehicle_packet_ts') or 0)
-    if last_pkt_ts <= 0:
-        last_pkt_ts = float(current_data.get('last_update') or 0)
-    age_s = (now_ts - last_pkt_ts) if last_pkt_ts else 999.0
+        now_ts = time.time()
+        last_pkt_ts = float(current_data.get('last_vehicle_packet_ts') or 0)
+        if last_pkt_ts <= 0:
+            last_pkt_ts = float(current_data.get('last_update') or 0)
+        age_s = (now_ts - last_pkt_ts) if last_pkt_ts else 999.0
 
-    # IMPORTANT: This fragment must be invoked inside `with st.sidebar:`.
-    # Do NOT use `st.sidebar.*` or sidebar placeholders here.
-
-    # Status
-    if current_data.get('link_active') and age_s < 3.0:
-        dbg_line = ""
-        if DEBUG:
-            dbg_line = f"<br><span style='font-size:0.75em; color:gray'>age={age_s:.1f}s</span>"
-        st.markdown(
-            f"✅ **ROVER ONLINE**{dbg_line}<br><span style='font-size:0.8em; color:gray'>Last Update: {datetime.datetime.now().strftime('%H:%M:%S')}</span>",
-            unsafe_allow_html=True,
-        )
-    elif current_data.get('link_active') and age_s < 12.0:
-        st.markdown(
-            f"⚠️ **LINK DEGRADED**<br><span style='font-size:0.75em; color:gray'>age={age_s:.1f}s</span>",
-            unsafe_allow_html=True,
-        )
-    else:
-        if DEBUG:
+        if current_data.get('link_active') and age_s < 3.0:
+            dbg_line = ""
+            if DEBUG:
+                dbg_line = f"<br><span style='font-size:0.75em; color:gray'>age={age_s:.1f}s</span>"
             st.markdown(
-                f"⚠️ **OFFLINE**<br><span style='font-size:0.75em; color:gray'>age={age_s:.1f}s</span>",
+                f"✅ **ROVER ONLINE**{dbg_line}<br><span style='font-size:0.8em; color:gray'>Last Update: {datetime.datetime.now().strftime('%H:%M:%S')}</span>",
+                unsafe_allow_html=True,
+            )
+        elif current_data.get('link_active') and age_s < 12.0:
+            st.markdown(
+                f"⚠️ **LINK DEGRADED**<br><span style='font-size:0.75em; color:gray'>age={age_s:.1f}s</span>",
                 unsafe_allow_html=True,
             )
         else:
-            st.error("OFFLINE: Searching...")
+            if DEBUG:
+                st.markdown(
+                    f"⚠️ **OFFLINE**<br><span style='font-size:0.75em; color:gray'>age={age_s:.1f}s</span>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.error("OFFLINE: Searching...")
 
-    # Mission transfer progress
-    dl_active = bool(current_data.get('mission_dl_active'))
-    dl_total = int(current_data.get('mission_dl_total') or 0)
-    dl_recv = int(current_data.get('mission_dl_received') or 0)
-    dl_done_ts = float(current_data.get('mission_dl_done_ts') or 0)
-    if dl_active:
-        if dl_total > 0:
-            st.progress(min(1.0, dl_recv / dl_total), text=f"Mission download {dl_recv}/{dl_total}")
+        dl_active = bool(current_data.get('mission_dl_active'))
+        dl_total = int(current_data.get('mission_dl_total') or 0)
+        dl_recv = int(current_data.get('mission_dl_received') or 0)
+        dl_done_ts = float(current_data.get('mission_dl_done_ts') or 0)
+        if dl_active:
+            if dl_total > 0:
+                st.progress(min(1.0, dl_recv / dl_total), text=f"Mission download {dl_recv}/{dl_total}")
+            else:
+                st.progress(0.0, text="Mission download: waiting for count…")
         else:
-            st.progress(0.0, text="Mission download: waiting for count…")
-    else:
-        if dl_total > 0 and (time.time() - dl_done_ts) <= MISSION_PROGRESS_GRACE_S:
-            st.progress(1.0, text=f"Mission download done {dl_recv}/{dl_total}")
+            if dl_total > 0 and (time.time() - dl_done_ts) <= MISSION_PROGRESS_GRACE_S:
+                st.progress(1.0, text=f"Mission download done {dl_recv}/{dl_total}")
 
-    ul_active  = bool(current_data.get('mission_ul_active'))
-    ul_total   = int(current_data.get('mission_ul_total') or 0)
-    ul_sent    = int(current_data.get('mission_ul_sent') or 0)
-    ul_done_ts = float(current_data.get('mission_ul_done_ts') or 0)
+        ul_active = bool(current_data.get('mission_ul_active'))
+        ul_total = int(current_data.get('mission_ul_total') or 0)
+        ul_sent = int(current_data.get('mission_ul_sent') or 0)
+        ul_done_ts = float(current_data.get('mission_ul_done_ts') or 0)
 
-    if ul_active:
-        if ul_total > 0:
-            st.progress(min(1.0, ul_sent / ul_total), text=f"Mission upload {ul_sent}/{ul_total}")
+        if ul_active:
+            if ul_total > 0:
+                st.progress(min(1.0, ul_sent / ul_total), text=f"Mission upload {ul_sent}/{ul_total}")
+            else:
+                st.markdown("**Mission upload:** starting…")
         else:
-            st.markdown("**Mission upload:** starting…")
-    else:
-        if ul_total > 0 and (time.time() - ul_done_ts) <= MISSION_PROGRESS_GRACE_S:
-            st.progress(1.0, text=f"Mission upload done {ul_sent}/{ul_total}")
+            if ul_total > 0 and (time.time() - ul_done_ts) <= MISSION_PROGRESS_GRACE_S:
+                st.progress(1.0, text=f"Mission upload done {ul_sent}/{ul_total}")
 
-    # Link quality + GPS blocks
-    lq = current_data.get('link_quality', 100)
-    lq_color = "#4caf50" if lq >= 90 else "#ff9800" if lq >= 70 else "#f44336"
-    lq_hist = current_data.get('link_quality_history', [])
-    radio_health = current_data.get('radio_health', None)
-    sparkline_svg = generate_sparkline(0, 100,lq_hist, color=lq_color)
-    st.markdown(sparkline_svg, unsafe_allow_html=True)
-    st.markdown(f":material/signal_cellular_alt: **Link Quality:** {lq}%")
-    if radio_health is not None:
-        st.markdown(f":material/network_cell: **Radio Health:** {int(radio_health)}%")
+        lq = current_data.get('link_quality', 100)
+        lq_color = "#4caf50" if lq >= 90 else "#ff9800" if lq >= 70 else "#f44336"
+        lq_hist = current_data.get('link_quality_history', [])
+        radio_health = current_data.get('radio_health', None)
+        sparkline_svg = generate_sparkline(0, 100, lq_hist, color=lq_color)
+        st.markdown(sparkline_svg, unsafe_allow_html=True)
+        st.markdown(f":material/signal_cellular_alt: **Link Quality:** {lq}%")
+        if radio_health is not None:
+            st.markdown(f":material/network_cell: **Radio Health:** {int(radio_health)}%")
 
-    # Box Temp sparkline (from MQTT_VAR1_TOPIC -> SharedState.mqtt_var1)
-    try:
-        box_temp_val = float(current_data.get('mqtt_var1', 0) or 0)
-    except Exception:
-        box_temp_val = 0.0
-    box_temp_i = int(round(box_temp_val))
+        try:
+            box_temp_val = float(current_data.get('mqtt_var1', 0) or 0)
+        except Exception:
+            box_temp_val = 0.0
+        box_temp_i = int(round(box_temp_val))
 
-    if "mqtt_var1_history" not in st.session_state:
-        st.session_state["mqtt_var1_history"] = []
-    if "_last_mqtt_var1_hist_ts" not in st.session_state:
-        st.session_state["_last_mqtt_var1_hist_ts"] = 0.0
+        if "mqtt_var1_history" not in st.session_state:
+            st.session_state["mqtt_var1_history"] = []
+        if "_last_mqtt_var1_hist_ts" not in st.session_state:
+            st.session_state["_last_mqtt_var1_hist_ts"] = 0.0
 
-    now_ts = time.time()
-    if (now_ts - float(st.session_state.get("_last_mqtt_var1_hist_ts") or 0.0)) >= 1.0:
-        hist = list(st.session_state.get("mqtt_var1_history") or [])
-        hist.append(box_temp_i)
-        if len(hist) > 50:
-            hist = hist[-50:]
-        st.session_state["mqtt_var1_history"] = hist
-        st.session_state["_last_mqtt_var1_hist_ts"] = now_ts
+        now_ts = time.time()
+        if (now_ts - float(st.session_state.get("_last_mqtt_var1_hist_ts") or 0.0)) >= 1.0:
+            hist = list(st.session_state.get("mqtt_var1_history") or [])
+            hist.append(box_temp_i)
+            if len(hist) > 50:
+                hist = hist[-50:]
+            st.session_state["mqtt_var1_history"] = hist
+            st.session_state["_last_mqtt_var1_hist_ts"] = now_ts
 
-    bt_hist = st.session_state.get("mqtt_var1_history") or []
-    lq_color =  "#f44336" if box_temp_i > 85 else "#ff9800" if box_temp_i > 0 else "#4caf50"
-    st.markdown(generate_sparkline(32, 130,bt_hist, color=lq_color), unsafe_allow_html=True)
-    st.markdown(f":material/device_thermostat: **Box Temperature:** {box_temp_i} °F")
+        bt_hist = st.session_state.get("mqtt_var1_history") or []
+        lq_color = "#f44336" if box_temp_i > 85 else "#ff9800" if box_temp_i > 0 else "#4caf50"
+        st.markdown(generate_sparkline(32, 130, bt_hist, color=lq_color), unsafe_allow_html=True)
+        st.markdown(f":material/device_thermostat: **Box Temperature:** {box_temp_i} °F")
 
-    gps_html = f"""
+        gps_html = f"""
 <div style="line-height: 1.2; font-size: 0.9rem;">
     <hr style="margin: 5px 0; border-color: #333;">
     <b><u>GPS 1:</b>&nbsp;&nbsp;&nbsp;{current_data.get('gps1_fix')}</u><br>
@@ -2354,8 +2584,8 @@ def _render_live_sidebar():
     -<b>Sats:</b>&nbsp;{current_data.get('satellites_visible')}
 </div>
 """
-    if current_data.get('gps2_fix'):
-        gps_html += f"""
+        if current_data.get('gps2_fix'):
+            gps_html += f"""
 <br>
 <div style="line-height: 1.2; font-size: 0.9rem;">
     <b><u>GPS 2:</b>&nbsp;&nbsp;&nbsp;{current_data.get('gps2_fix')}</u><br>
@@ -2366,117 +2596,104 @@ def _render_live_sidebar():
     -<b>Sats:</b>&nbsp;{current_data.get('gps2_satellites_visible')}
 </div>
 """
-    st.markdown(gps_html, unsafe_allow_html=True)
+        st.markdown(gps_html, unsafe_allow_html=True)
 
-    # st.markdown("""
-    # ### <u>GPS 1: &nbsp;RTK Fix</u>
-    # - **Lat:** &nbsp;38.4045464
-    # - **Lon:** -90.233347
-    # - **Sats:** 10
-    # """, unsafe_allow_html=True)    
+    @st.fragment(run_every=1.5)
+    def _render_live_map():
+        current_data = get_shared_state().get()
 
-@st.fragment(run_every=1.5)
-def _render_live_map():
+        current_mode = str(current_data.get('mode') or '')
+        if current_mode != 'AUTO':
+            mission_progress_placeholder.empty()
+        else:
+            try:
+                wp_current = int(current_data.get('wp_current') or 0)
+            except Exception:
+                wp_current = 0
 
-    current_data = get_shared_state().get()
+            total_wps = int(current_data.get('mission_dl_total') or 0)
+            if total_wps <= 0:
+                pts = current_data.get('mission_points') or []
+                if isinstance(pts, list):
+                    total_wps = len(pts)
 
-    # Mission progress (only show while in AUTO)
-    current_mode = str(current_data.get('mode') or '')
-    if current_mode != 'AUTO':
-        mission_progress_placeholder.empty()
-    else:
+            with mission_progress_placeholder.container():
+                if total_wps > 0:
+                    denom = max(total_wps - 1, 1)
+                    frac = max(0.0, min(1.0, wp_current / denom))
+                    shown_cur = min(max(wp_current + 1, 1), total_wps)
+                    st.progress(frac, text=f"Mission progress {shown_cur}/{total_wps}")
+                else:
+                    st.progress(0.0, text="Mission progress: awaiting mission…")
+
         try:
-            wp_current = int(current_data.get('wp_current') or 0)
+            map_style_name = st.session_state.get("map_style_select_fixed") or map_options[st.session_state.get("map_style_ind", 0)]
         except Exception:
-            wp_current = 0
+            map_style_name = map_options[0]
+        selected_map_style = map_styles.get(map_style_name, list(map_styles.values())[0])
 
-        total_wps = int(current_data.get('mission_dl_total') or 0)
-        if total_wps <= 0:
-            pts = current_data.get('mission_points') or []
-            if isinstance(pts, list):
-                total_wps = len(pts)
+        map_sig = _map_signature(current_data, map_style_name)
+        last_map_sig = st.session_state.get('_last_map_sig')
+        if (last_map_sig != map_sig) or ('_last_map_deck' not in st.session_state):
+            deck = create_map_deck(current_data, selected_map_style)
+            st.session_state['_last_map_deck'] = deck
+            st.session_state['_last_map_sig'] = map_sig
+        else:
+            deck = st.session_state.get('_last_map_deck')
 
-        with mission_progress_placeholder.container():
-            if total_wps > 0:
-                denom = max(total_wps - 1, 1)
-                frac = max(0.0, min(1.0, wp_current / denom))
-                shown_cur = min(max(wp_current + 1, 1), total_wps)
-                st.progress(frac, text=f"Mission progress {shown_cur}/{total_wps}")
-            else:
-                st.progress(0.0, text="Mission progress: awaiting mission…")
+        if deck:
+            map_placeholder.pydeck_chart(deck, key="map_chart", width="stretch")
+        else:
+            map_placeholder.info("🛰️ Waiting for GPS Position...")
 
-    # Map style comes from session_state (set by the sidebar controls fragment)
-    try:
-        map_style_name = st.session_state.get("map_style_select_fixed") or map_options[st.session_state.get("map_style_ind", 0)]
-    except Exception:
-        map_style_name = map_options[0]
-    selected_map_style = map_styles.get(map_style_name, list(map_styles.values())[0])
-
-    # Map (cache deck unless signature changes)
-    map_sig = _map_signature(current_data, map_style_name)
-    last_map_sig = st.session_state.get('_last_map_sig')
-    if (last_map_sig != map_sig) or ('_last_map_deck' not in st.session_state):
-        deck = create_map_deck(current_data, selected_map_style)
-        st.session_state['_last_map_deck'] = deck
-        st.session_state['_last_map_sig'] = map_sig
-    else:
-        deck = st.session_state.get('_last_map_deck')
-
-    if deck:
-        map_placeholder.pydeck_chart(deck, key="map_chart", width="stretch")
-    else:
-        map_placeholder.info("🛰️ Waiting for GPS Position...")
-
-@st.fragment(run_every=2.0)
-def _mqtt_publish_tick():
-    mqtt_enabled = (os.getenv("MQTT_ENABLED", "") or "").strip().lower()
-    if mqtt_enabled in ("", "0", "false", "no", "off"):
-        return
-    try:
-        from mavweb_mqtt import publish_stats
-        publish_stats()
-    except Exception:
-        # best-effort; never break UI
-        pass
-
-@st.fragment(run_every=0.8)
-def _render_live_console():
-    current_data = get_shared_state().get()
-    msg_log = "<br>".join(current_data.get('messages', []))
-    console_placeholder.markdown(
-        f"""
-        <div style="height:200px; overflow-y:auto; background-color:#0e1117; border:1px solid #30363d; padding:10px; color:#58a6ff; font-family:monospace; font-size:0.8rem;">
-            {msg_log}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-try:
-    _render_live_metrics()
-    _render_live_map()
-    _render_live_console()
-    _mqtt_publish_tick()
-
-    # MQTT publish (best-effort; never crash UI)
-    mqtt_enabled = (os.getenv("MQTT_ENABLED", "") or "").strip().lower()
-    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] MQTT_ENABLED={mqtt_enabled}")
-    if mqtt_enabled not in ("", "0", "false", "no", "off"):
+    @st.fragment(run_every=2.0)
+    def _mqtt_publish_tick():
+        mqtt_enabled = (os.getenv("MQTT_ENABLED", "") or "").strip().lower()
+        if mqtt_enabled in ("", "0", "false", "no", "off"):
+            return
         try:
             from mavweb_mqtt import publish_stats
-            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] Publishing MQTT stats...")
             publish_stats()
         except Exception:
             pass
 
-    # Sidebar: invoke fragments inside a sidebar context.
-    with st.sidebar:
-#        st.title(":material/agriculture: MavWeb")
-#        st.divider()
-        _render_live_sidebar()
-        st.divider()
-        _render_sidebar_controls()
-except Exception as e:
-    # Avoid killing the whole app if the live fragment hits a transient error.
-    if DEBUG:
-        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] Live UI error: {e}")
+    @st.fragment(run_every=0.8)
+    def _render_live_console():
+        current_data = get_shared_state().get()
+        msg_log = "<br>".join(current_data.get('messages', []))
+        console_placeholder.markdown(
+            f"""
+            <div style="height:200px; overflow-y:auto; background-color:#0e1117; border:1px solid #30363d; padding:10px; color:#58a6ff; font-family:monospace; font-size:0.8rem;">
+                {msg_log}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    try:
+        _render_live_metrics()
+        _render_live_map()
+        _render_live_console()
+        _mqtt_publish_tick()
+
+        mqtt_enabled = (os.getenv("MQTT_ENABLED", "") or "").strip().lower()
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] MQTT_ENABLED={mqtt_enabled}")
+        if mqtt_enabled not in ("", "0", "false", "no", "off"):
+            try:
+                from mavweb_mqtt import publish_stats
+                print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] Publishing MQTT stats...")
+                publish_stats()
+            except Exception:
+                pass
+
+        with st.sidebar:
+            _render_live_sidebar()
+            st.divider()
+            _render_sidebar_controls()
+    except Exception as e:
+        if DEBUG:
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [App] Live UI error: {e}")
+
+
+if __name__ == "__main__":
+    render_dashboard_page()
