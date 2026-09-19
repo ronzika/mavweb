@@ -121,7 +121,7 @@ def _filter_dataframe_for_mask(df: pd.DataFrame, mask_info: dict) -> pd.DataFram
         return pd.DataFrame()
 
     keep_cols = [
-        c for c in ["timestamp", "mode", "armed", "gps_fix", "link_quality", "signal_source", "gcs_pid_mask"]
+        c for c in ["timestamp", "mode", "armed", "gps_fix", "link_quality", "speed_ms", "signal_source", "gcs_pid_mask"]
         if c in df.columns
     ]
 
@@ -199,6 +199,7 @@ def _build_session_summary(df: pd.DataFrame) -> dict:
         "speed_mae": None,
         "steer_max_abs_err": None,
         "speed_max_abs_err": None,
+        "max_speed_seen": None,
     }
 
     if df.empty:
@@ -223,6 +224,19 @@ def _build_session_summary(df: pd.DataFrame) -> dict:
         if not s.empty:
             summary["speed_mae"] = float(s.abs().mean())
             summary["speed_max_abs_err"] = float(s.abs().max())
+
+    if "speed_ms_raw" in df.columns:
+        s = pd.to_numeric(df["speed_ms_raw"], errors="coerce").dropna()
+        if not s.empty:
+            summary["max_speed_seen"] = float(s.max())
+    elif "speed_ms" in df.columns:
+        s = pd.to_numeric(df["speed_ms"], errors="coerce").dropna()
+        if not s.empty:
+            summary["max_speed_seen"] = float(s.max())
+    elif "speed_achieved" in df.columns:
+        s = pd.to_numeric(df["speed_achieved"], errors="coerce").dropna()
+        if not s.empty:
+            summary["max_speed_seen"] = float(s.max())
 
     return summary
 
@@ -752,33 +766,50 @@ with st.container():
         st.rerun()
 
     if not filtered_df.empty:
-        st.subheader("Session Summary")
-        summary = _build_session_summary(filtered_df)
-        sm1, sm2, sm3 = st.columns(3)
-        sm1.metric("Samples", f"{summary['sample_count']}")
-        sm2.metric("Duration", f"{summary['duration_s']:.1f}s")
-        sm3.metric("Steer MAE", "N/A" if summary["steer_mae"] is None else f"{summary['steer_mae']:.3f}")
+        with st.expander("Session Summary", expanded=False):
+            summary = _build_session_summary(filtered_df)
+            if summary.get("max_speed_seen") is None:
+                if "speed_ms_raw" in df.columns:
+                    raw_speed = pd.to_numeric(df["speed_ms_raw"], errors="coerce").dropna()
+                    if not raw_speed.empty:
+                        summary["max_speed_seen"] = float(raw_speed.max())
+                elif "speed_ms" in df.columns:
+                    raw_speed = pd.to_numeric(df["speed_ms"], errors="coerce").dropna()
+                    if not raw_speed.empty:
+                        summary["max_speed_seen"] = float(raw_speed.max())
+                elif "speed_achieved" in df.columns:
+                    raw_speed = pd.to_numeric(df["speed_achieved"], errors="coerce").dropna()
+                    if not raw_speed.empty:
+                        summary["max_speed_seen"] = float(raw_speed.max())
+            sm1, sm2, sm3 = st.columns(3)
+            sm1.metric("Samples", f"{summary['sample_count']}")
+            sm2.metric("Duration", f"{summary['duration_s']:.1f}s")
+            sm3.metric("Steer MAE", "N/A" if summary["steer_mae"] is None else f"{summary['steer_mae']:.3f}")
 
-        sm4, sm5, sm6 = st.columns(3)
-        sm4.metric("Speed MAE", "N/A" if summary["speed_mae"] is None else f"{summary['speed_mae']:.3f}")
-        sm5.metric(
-            "Steer Max |Err|",
-            "N/A" if summary["steer_max_abs_err"] is None else f"{summary['steer_max_abs_err']:.3f}",
-        )
-        sm6.metric(
-            "Speed Max |Err|",
-            "N/A" if summary["speed_max_abs_err"] is None else f"{summary['speed_max_abs_err']:.3f}",
-        )
+            sm4, sm5, sm6, sm7 = st.columns(4)
+            sm4.metric("Speed MAE", "N/A" if summary["speed_mae"] is None else f"{summary['speed_mae']:.3f}")
+            sm5.metric(
+                "Steer Max |Err|",
+                "N/A" if summary["steer_max_abs_err"] is None else f"{summary['steer_max_abs_err']:.3f}",
+            )
+            sm6.metric(
+                "Speed Max |Err|",
+                "N/A" if summary["speed_max_abs_err"] is None else f"{summary['speed_max_abs_err']:.3f}",
+            )
+            sm7.metric(
+                "Max Speed Seen (m/s)",
+                "N/A" if summary["max_speed_seen"] is None else f"{summary['max_speed_seen']:.3f}",
+            )
 
-        csv_bytes = filtered_df.to_csv(index=False).encode("utf-8")
-        ts_tag = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        st.download_button(
-            "Download Session CSV",
-            data=csv_bytes,
-            file_name=f"pid_session_{ts_tag}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+            csv_bytes = filtered_df.to_csv(index=False).encode("utf-8")
+            ts_tag = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            st.download_button(
+                "Download Session CSV",
+                data=csv_bytes,
+                file_name=f"pid_session_{ts_tag}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
 with st.container():
     st.subheader("Rover Parameters")

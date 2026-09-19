@@ -1780,6 +1780,7 @@ def mavlink_worker(endpoint, state):
 
                 elif mtype == 'VFR_HUD':
                     data['speed_ms'] = round(msg.groundspeed, 2)
+                    data['speed_ms_raw'] = float(msg.groundspeed)
                     data['heading_deg'] = msg.heading
 
                 elif mtype == 'PID_TUNING':
@@ -2116,6 +2117,8 @@ def mavlink_worker(endpoint, state):
                             'armed': bool(cur.get('armed')),
                             'gps_fix': str(cur.get('gps1_fix') or ''),
                             'link_quality': int(cur.get('link_quality') or 0),
+                            'speed_ms_raw': data.get('speed_ms_raw', cur.get('speed_ms_raw')),
+                            'speed_ms': data.get('speed_ms', cur.get('speed_ms')),
                             'steering_desired': (
                                 data.get('pid_steering_desired', cur.get('pid_steering_desired')) if allow_steering_metric else None
                             ),
