@@ -185,7 +185,7 @@ TELEMETRY_MESSAGE_INTERVALS: list[tuple[int, float]] = [
     (mavutil.mavlink.MAVLINK_MSG_ID_MISSION_CURRENT, 2),
     (mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD, 2),
     (mavutil.mavlink.MAVLINK_MSG_ID_GPS2_RAW, 1),
-    (mavutil.mavlink.MAVLINK_MSG_ID_PID_TUNING, 8),
+    (mavutil.mavlink.MAVLINK_MSG_ID_PID_TUNING, 20),
 ]
 
 
