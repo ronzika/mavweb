@@ -304,6 +304,17 @@ def _wrap_reason_text(text: str, width: int = 56) -> str:
     return "\n".join(parts)
 
 
+def _editor_row_height_for_reasons(reasons: list[str], base_px: int = 34, line_px: int = 16, max_px: int = 120) -> int:
+    max_lines = 1
+    for reason in reasons or []:
+        txt = str(reason or "")
+        line_count = max(1, txt.count("\n") + 1)
+        if line_count > max_lines:
+            max_lines = line_count
+    # Keep compact rows for single-line content; expand only when wrapped lines exist.
+    return min(max_px, base_px + ((max_lines - 1) * line_px))
+
+
 def _extract_llm_recommendations(output_text: str, param_names: list[str] | None = None) -> dict[str, dict[str, str]]:
     if not output_text:
         return {}
@@ -556,6 +567,99 @@ def _submit_to_openrouter(csv_text: str, model: str, param_snapshot_text: str = 
     }
 
 
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-top: 0.75rem;
+    }
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+        margin-top: 0 !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div[data-testid="stToggle"]) {
+        margin-bottom: 0 !important;
+    }
+    .pid-recording-title-row {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    .pid-recording-title-row h3 {
+        margin: 0;
+    }
+    .pid-live-title-row {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    .pid-live-title-row h3 {
+        margin: 0;
+    }
+    .pid-recording-title-row h3 .pid-recording-dot {
+        display: inline-block;
+        width: 0.55em;
+        height: 0.55em;
+        margin-left: 0.4em;
+        border-radius: 50%;
+        background: #d32f2f;
+        box-shadow: 0 0 0 rgba(211, 47, 47, 0.55);
+        animation: pidPulse 1.8s ease-in-out infinite;
+        vertical-align: middle;
+    }
+    .pid-live-title-row h3 .pid-live-dot {
+        display: inline-block;
+        width: 0.55em;
+        height: 0.55em;
+        margin-left: 0.4em;
+        border-radius: 50%;
+        vertical-align: middle;
+    }
+    .pid-live-title-row h3 .pid-live-dot.live {
+        background: #2e7d32;
+        box-shadow: 0 0 0 rgba(46, 125, 50, 0.5);
+        animation: pidLivePulse 1.8s ease-in-out infinite;
+    }
+    .pid-live-title-row h3 .pid-live-dot.stale {
+        background: #d32f2f;
+        box-shadow: none;
+        animation: none;
+    }
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.pid-live-title-row) [data-testid="stMetricValue"] {
+        font-size: 1.5rem;
+    }
+    @keyframes pidPulse {
+        0% {
+            transform: scale(0.85);
+            box-shadow: 0 0 0 0 rgba(211, 47, 47, 0.55);
+        }
+        70% {
+            transform: scale(1.0);
+            box-shadow: 0 0 0 10px rgba(211, 47, 47, 0.0);
+        }
+        100% {
+            transform: scale(0.85);
+            box-shadow: 0 0 0 0 rgba(211, 47, 47, 0.0);
+        }
+    }
+    @keyframes pidLivePulse {
+        0% {
+            transform: scale(0.85);
+            box-shadow: 0 0 0 0 rgba(46, 125, 50, 0.5);
+        }
+        70% {
+            transform: scale(1.0);
+            box-shadow: 0 0 0 10px rgba(46, 125, 50, 0.0);
+        }
+        100% {
+            transform: scale(0.85);
+            box-shadow: 0 0 0 0 rgba(46, 125, 50, 0.0);
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title(":material/tune: PID Tuning")
 st.caption("Capture desired vs achieved telemetry, tune rover parameters, and submit session CSV to an LLM.")
 
@@ -570,31 +674,35 @@ if "pid_llm_submit_requested" not in st.session_state:
 
 llm_is_running = str(st.session_state.get("pid_llm_last_status") or "") == "running"
 llm_submit_armed = bool(st.session_state.get("pid_llm_submit_requested", False))
-
-if "pid_live_autorefresh" not in st.session_state:
-    st.session_state["pid_live_autorefresh"] = True
-
-live_refresh = st.toggle(
-    "Auto-refresh live telemetry",
-    value=bool(st.session_state.get("pid_live_autorefresh", True)),
-    help="Disable while reviewing LLM output to keep the screen static.",
-)
-st.session_state["pid_live_autorefresh"] = bool(live_refresh)
-
-# IMPORTANT: Do not schedule timed reruns while an LLM submission is active,
-# or the request can be interrupted and leave status stuck at "running".
-if live_refresh and not llm_is_running and not llm_submit_armed:
-    st_autorefresh(interval=1000, key="pid_tuning_refresh")
 ensure_runtime_started()
 
 state = get_shared_state()
 snap = state.get()
+rec_active_global = bool(snap.get("pid_recording_active"))
+
+# Keep stream-status indicators current while this page is open.
+# Use faster refresh while recording, slower refresh while idle.
+if not llm_is_running and not llm_submit_armed:
+    refresh_interval_ms = 1000 if rec_active_global else 2000
+    st_autorefresh(interval=refresh_interval_ms, key="pid_tuning_refresh")
 
 if not snap.get("link_active"):
     st.warning("Telemetry link appears offline. Open Dashboard first to initialize MAVLink worker if needed.")
 
-with st.container():
-    st.subheader("Live PID Signals")
+with st.container(border=True):
+    now_s = time.time()
+    pid_last_tuning_msg_ts = float(snap.get("pid_last_tuning_msg_ts") or 0.0)
+    pid_streaming_live = bool(snap.get("link_active")) and pid_last_tuning_msg_ts > 0.0 and (now_s - pid_last_tuning_msg_ts) <= 3.0
+    live_dot_state = "live" if pid_streaming_live else "stale"
+    live_dot_label = "PID stream live" if pid_streaming_live else "PID stream not live"
+    st.markdown(
+        (
+            '<div class="pid-live-title-row"><h3>Live PID Signals'
+            f'<span class="pid-live-dot {live_dot_state}" aria-label="{live_dot_label}"></span>'
+            "</h3></div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
     signal_source = str(snap.get("pid_signal_source") or "unknown")
 
@@ -729,23 +837,33 @@ with st.container():
     else:
         st.info("No PID samples recorded yet.")
 
-    st.subheader("Recording")
-    rec_active = bool(snap.get("pid_recording_active"))
+    rec_active = rec_active_global
+    recording_dot_html = '<span class="pid-recording-dot" aria-label="recording active"></span>' if rec_active else ""
+    st.markdown(
+        f'<div class="pid-recording-title-row"><h3>Recording{recording_dot_html}</h3></div>',
+        unsafe_allow_html=True,
+    )
     rec_label = "Recording" if rec_active else "Stopped"
     st.write(f"State: {rec_label}")
 
     params_loaded, loaded_count, required_total = _params_loaded_for_mask(cache_for_mask, mask_info)
+    link_active = bool(snap.get("link_active"))
+    can_start_recording = bool(pid_streaming_live and link_active)
     if not params_loaded:
         if required_total == 0:
-            st.caption("Load rover parameters first (including GCS_PID_MASK) to enable recording.")
+            st.caption("Load rover parameters (including GCS_PID_MASK) to improve metric validation and LLM output quality.")
         else:
             st.caption(
-                "Load rover parameters first (use Fetch All Params) to enable recording "
+                "Load rover parameters (use Fetch All Params) to improve metric validation and LLM output quality "
                 f"({loaded_count}/{required_total} required params loaded)."
             )
+    if not link_active:
+        st.caption("Telemetry link must be active to enable recording.")
+    if link_active and not pid_streaming_live:
+        st.caption("PID_TUNING stream must be live (green Live PID Signals dot) to enable recording.")
 
     rc1, rc2, rc3 = st.columns(3)
-    if rc1.button("Start Recording", use_container_width=True, disabled=(not params_loaded)):
+    if rc1.button("Start Recording", use_container_width=True, disabled=((not can_start_recording) or rec_active)):
         state.update({
             "pid_recording_active": True,
             "pid_recording_started_ts": time.time(),
@@ -754,7 +872,7 @@ with st.container():
         })
         st.rerun()
 
-    if rc2.button("Stop Recording", use_container_width=True):
+    if rc2.button("Stop Recording", use_container_width=True, disabled=(not rec_active)):
         state.update({
             "pid_recording_active": False,
             "pid_recording_stopped_ts": time.time(),
@@ -811,7 +929,7 @@ with st.container():
                 use_container_width=True,
             )
 
-with st.container():
+with st.container(border=True):
     st.subheader("Rover Parameters")
 
     if st.button("Fetch All Params", use_container_width=True):
@@ -882,11 +1000,13 @@ with st.container():
         if "updated" in table_df.columns:
             updated_dt = pd.to_datetime(table_df["updated"], unit="s", errors="coerce")
             table_df["updated"] = updated_dt.dt.strftime("%H:%M:%S").fillna("")
+        reason_values = table_df["Reason"].tolist() if "Reason" in table_df.columns else []
+        adaptive_row_height = _editor_row_height_for_reasons(reason_values)
         edited_table_df = st.data_editor(
             table_df,
             width="stretch",
             height=280,
-            row_height=78,
+            row_height=adaptive_row_height,
             hide_index=True,
             disabled=["group", "param", "value", "LLM", "Reason", "updated"],
             column_config={
@@ -1001,14 +1121,13 @@ elif last_status == "running":
         st.session_state["pid_llm_last_status"] = "idle"
         st.session_state["pid_llm_last_error"] = ""
         st.session_state["pid_llm_status_ts"] = 0.0
-        st.session_state["pid_live_autorefresh"] = False
         st.rerun()
 
 submit_disabled = filtered_df.empty
 if str(st.session_state.get("pid_llm_last_status") or "") == "running":
     submit_disabled = True
 
-submit_clicked = st.button("Submit Recorded CSV To LLM", disabled=submit_disabled, use_container_width=True)
+submit_clicked = st.button("Submit Data to AI Model", disabled=submit_disabled, use_container_width=True)
 if submit_clicked:
     # Clear previous LLM output and reset parameter-table recommendation UI for a fresh run.
     st.session_state["pid_llm_result"] = ""
@@ -1020,7 +1139,6 @@ if submit_clicked:
 
     # Phase 1: arm submit and rerun with refresh disabled.
     st.session_state["pid_llm_submit_requested"] = True
-    st.session_state["pid_live_autorefresh"] = False
     st.rerun()
 
 if bool(st.session_state.get("pid_llm_submit_requested", False)):

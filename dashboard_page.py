@@ -1793,6 +1793,7 @@ def mavlink_worker(endpoint, state):
 
                 elif mtype == 'PID_TUNING':
                     try:
+                        data['pid_last_tuning_msg_ts'] = time.time()
                         axis = int(getattr(msg, 'axis', -1) or -1)
                         steer_axis = int(getattr(mavutil.mavlink, 'PID_TUNING_STEER', -1) or -1)
                         speed_axis = int(getattr(mavutil.mavlink, 'PID_TUNING_ACCZ', -1) or -1)
