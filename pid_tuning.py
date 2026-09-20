@@ -272,16 +272,36 @@ def _prepare_csv_for_llm(df: pd.DataFrame) -> tuple[str, str]:
     return csv_text, note
 
 
-def _build_param_snapshot_text(param_cache: dict, param_names: list[str]) -> str:
+def _build_param_snapshot_text(param_cache: dict, param_names: list[str] | None = None) -> str:
     lines = ["parameter,value,updated_ts"]
-    for name in param_names:
-        entry = param_cache.get(name, {}) if isinstance(param_cache, dict) else {}
+    if not isinstance(param_cache, dict):
+        return "\n".join(lines)
+
+    emitted = set()
+
+    # When explicit names are provided, keep those first (for deterministic ordering)
+    # and still include all remaining cached FC params afterward.
+    for name in list(param_names or []):
+        entry = param_cache.get(name, {}) if isinstance(param_cache.get(name), dict) else {}
         value = entry.get("value")
         updated_ts = entry.get("updated_ts")
         if value is None:
             lines.append(f"{name},MISSING,")
         else:
             lines.append(f"{name},{value},{updated_ts or ''}")
+        emitted.add(name)
+
+    for name in sorted(param_cache.keys()):
+        if name in emitted:
+            continue
+        entry = param_cache.get(name, {}) if isinstance(param_cache.get(name), dict) else {}
+        value = entry.get("value")
+        updated_ts = entry.get("updated_ts")
+        if value is None:
+            lines.append(f"{name},MISSING,")
+        else:
+            lines.append(f"{name},{value},{updated_ts or ''}")
+
     return "\n".join(lines)
 
 
@@ -1270,13 +1290,16 @@ if bool(st.session_state.get("pid_llm_submit_requested", False)):
             f"Prepared to submit {len(filtered_df)} recorded rows for metric scope: {mask_info.get('label')}"
         )
         param_cache = dict((state.get().get("param_cache") or {}))
-        param_names = list(_flatten_params().keys())
-        param_snapshot_text = _build_param_snapshot_text(param_cache, param_names)
+        param_snapshot_text = _build_param_snapshot_text(param_cache)
+        cached_total = len(param_cache)
         present_count = sum(
-            1 for pname in param_names
-            if isinstance(param_cache.get(pname), dict) and (param_cache.get(pname) or {}).get("value") is not None
+            1
+            for entry in param_cache.values()
+            if isinstance(entry, dict) and entry.get("value") is not None
         )
-        steps.append(f"Parameter snapshot prepared: {present_count}/{len(param_names)} values present")
+        steps.append(
+            f"Parameter snapshot prepared from FC cache: {present_count}/{cached_total} cached values present"
+        )
         csv_text, prep_note = _prepare_csv_for_llm(filtered_df)
         steps.append(f"CSV payload prepared with {len(csv_text)} characters")
         if prep_note:
