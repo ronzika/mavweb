@@ -590,7 +590,12 @@ st.markdown(
     .pid-live-title-row {
         display: flex;
         align-items: center;
+        justify-content: space-between;
         gap: 0.5rem;
+    }
+    .pid-live-title-main {
+        display: flex;
+        align-items: center;
     }
     .pid-live-title-row h3 {
         margin: 0;
@@ -606,7 +611,7 @@ st.markdown(
         animation: pidPulse 1.8s ease-in-out infinite;
         vertical-align: middle;
     }
-    .pid-live-title-row h3 .pid-live-dot {
+    .pid-live-title-main h3 .pid-live-dot {
         display: inline-block;
         width: 0.55em;
         height: 0.55em;
@@ -614,15 +619,43 @@ st.markdown(
         border-radius: 50%;
         vertical-align: middle;
     }
-    .pid-live-title-row h3 .pid-live-dot.live {
+    .pid-live-title-main h3 .pid-live-dot.live {
         background: #2e7d32;
         box-shadow: 0 0 0 rgba(46, 125, 50, 0.5);
         animation: pidLivePulse 1.8s ease-in-out infinite;
     }
-    .pid-live-title-row h3 .pid-live-dot.stale {
+    .pid-live-title-main h3 .pid-live-dot.stale {
         background: #d32f2f;
         box-shadow: none;
         animation: none;
+    }
+    .pid-live-title-metrics {
+        display: flex;
+        align-items: center;
+        gap: 0.8rem;
+        flex-wrap: wrap;
+    }
+    .pid-live-title-metric-item {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 0.35rem;
+    }
+    .pid-live-title-metric-label {
+        font-size: 0.78rem;
+        font-weight: 600;
+        color: #6b7280;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+    }
+    .pid-live-title-metric-value {
+        font-size: 0.95rem;
+        font-weight: 600;
+    }
+    div[data-testid="stDataFrame"] [role="columnheader"] {
+        justify-content: center !important;
+    }
+    div[data-testid="stDataFrame"] [role="columnheader"] * {
+        text-align: center !important;
     }
     div[data-testid="stVerticalBlockBorderWrapper"]:has(.pid-live-title-row) [data-testid="stMetricValue"] {
         font-size: 1.5rem;
@@ -671,6 +704,10 @@ if "pid_llm_status_ts" not in st.session_state:
     st.session_state["pid_llm_status_ts"] = 0.0
 if "pid_llm_submit_requested" not in st.session_state:
     st.session_state["pid_llm_submit_requested"] = False
+if "pid_param_fetch_prompt_open" not in st.session_state:
+    st.session_state["pid_param_fetch_prompt_open"] = False
+if "pid_param_fetch_prompt_signature_shown" not in st.session_state:
+    st.session_state["pid_param_fetch_prompt_signature_shown"] = ""
 
 llm_is_running = str(st.session_state.get("pid_llm_last_status") or "") == "running"
 llm_submit_armed = bool(st.session_state.get("pid_llm_submit_requested", False))
@@ -695,26 +732,11 @@ with st.container(border=True):
     pid_streaming_live = bool(snap.get("link_active")) and pid_last_tuning_msg_ts > 0.0 and (now_s - pid_last_tuning_msg_ts) <= 3.0
     live_dot_state = "live" if pid_streaming_live else "stale"
     live_dot_label = "PID stream live" if pid_streaming_live else "PID stream not live"
-    st.markdown(
-        (
-            '<div class="pid-live-title-row"><h3>Live PID Signals'
-            f'<span class="pid-live-dot {live_dot_state}" aria-label="{live_dot_label}"></span>'
-            "</h3></div>"
-        ),
-        unsafe_allow_html=True,
-    )
-
     signal_source = str(snap.get("pid_signal_source") or "unknown")
 
     cache_for_mask = dict((snap.get("param_cache") or {}))
     mask_info = _resolve_pid_mask_from_cache(cache_for_mask)
     mask_raw = mask_info.get("raw")
-    if mask_info.get("known"):
-        st.caption(f"GCS_PID_MASK={mask_raw} | active metrics: {mask_info.get('label')}")
-    else:
-        st.warning(
-            "GCS_PID_MASK is unavailable. Fetch parameters first so the PID page can show, record, and submit only valid metric types."
-        )
 
     now_vals = {
         "steering_desired": snap.get("pid_steering_desired"),
@@ -723,20 +745,66 @@ with st.container(border=True):
         "speed_achieved": snap.get("pid_speed_achieved"),
     }
 
-    if mask_info.get("steering") and mask_info.get("speed"):
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Steer Desired", f"{_coerce_float(now_vals['steering_desired']):.3f}")
-        c2.metric("Steer Achieved", f"{_coerce_float(now_vals['steering_achieved']):.3f}")
-        c3.metric("Speed Desired", f"{_coerce_float(now_vals['speed_desired']):.3f}")
-        c4.metric("Speed Achieved", f"{_coerce_float(now_vals['speed_achieved']):.3f}")
-    elif mask_info.get("steering"):
-        c1, c2 = st.columns(2)
-        c1.metric("Steer Desired", f"{_coerce_float(now_vals['steering_desired']):.3f}")
-        c2.metric("Steer Achieved", f"{_coerce_float(now_vals['steering_achieved']):.3f}")
-    elif mask_info.get("speed"):
-        c1, c2 = st.columns(2)
-        c1.metric("Speed Desired", f"{_coerce_float(now_vals['speed_desired']):.3f}")
-        c2.metric("Speed Achieved", f"{_coerce_float(now_vals['speed_achieved']):.3f}")
+    def _fmt_live_value(v) -> str:
+        if v is None or pd.isna(v):
+            return "N/A"
+        return f"{_coerce_float(v):.3f}"
+
+    live_metric_items = []
+    if mask_info.get("steering"):
+        live_metric_items.extend([
+            (
+                "Steer Desired",
+                _fmt_live_value(now_vals.get("steering_desired")),
+            ),
+            (
+                "Steer Achieved",
+                _fmt_live_value(now_vals.get("steering_achieved")),
+            ),
+        ])
+    if mask_info.get("speed"):
+        live_metric_items.extend([
+            (
+                "Speed Desired",
+                _fmt_live_value(now_vals.get("speed_desired")),
+            ),
+            (
+                "Speed Achieved",
+                _fmt_live_value(now_vals.get("speed_achieved")),
+            ),
+        ])
+
+    live_metrics_html = "".join(
+        (
+            '<div class="pid-live-title-metric-item">'
+            f'<span class="pid-live-title-metric-label">{label}</span>'
+            f'<span class="pid-live-title-metric-value">{value}</span>'
+            "</div>"
+        )
+        for label, value in live_metric_items
+    )
+
+    header_left, header_right = st.columns([3.2, 2.4])
+    with header_left:
+        st.markdown(
+            (
+                '<div class="pid-live-title-main"><h3>Live PID Signals'
+                f'<span class="pid-live-dot {live_dot_state}" aria-label="{live_dot_label}"></span>'
+                '</h3></div>'
+            ),
+            unsafe_allow_html=True,
+        )
+        if mask_info.get("known"):
+            st.caption(f"GCS_PID_MASK={mask_raw} | active metrics: {mask_info.get('label')}")
+        else:
+            st.warning(
+                "GCS_PID_MASK is unavailable. Fetch parameters first so the PID page can show, record, and submit only valid metric types."
+            )
+    with header_right:
+        st.markdown(
+            f'<div class="pid-live-title-metrics">{live_metrics_html}</div>',
+            unsafe_allow_html=True,
+        )
 
     steer_desired_raw = now_vals.get("steering_desired")
     steer_achieved_raw = now_vals.get("steering_achieved")
@@ -939,6 +1007,50 @@ with st.container(border=True):
     all_params = _flatten_params()
 
     cache = dict((state.get().get("param_cache") or {}))
+    visible_groups = _filter_param_groups_for_mask(mask_info)
+
+    required_param_names = [pname for params in visible_groups.values() for pname in params.keys()]
+    missing_param_names = []
+    for pname in required_param_names:
+        entry = cache.get(pname, {}) if isinstance(cache, dict) else {}
+        if not isinstance(entry, dict) or entry.get("value") is None:
+            missing_param_names.append(pname)
+
+    missing_signature = "|".join(sorted(missing_param_names))
+    if missing_param_names:
+        if (
+            not st.session_state.get("pid_param_fetch_prompt_open", False)
+            and st.session_state.get("pid_param_fetch_prompt_signature_shown", "") != missing_signature
+        ):
+            st.session_state["pid_param_fetch_prompt_open"] = True
+            st.session_state["pid_param_fetch_prompt_signature_shown"] = missing_signature
+            st.rerun()
+    else:
+        st.session_state["pid_param_fetch_prompt_signature_shown"] = ""
+
+    @st.dialog("Rover Parameters Missing")
+    def _show_param_fetch_prompt(missing_names: list[str]):
+        st.write(
+            "Some rover parameter values are not populated. "
+            "Would you like to fetch parameters from the flight controller now?"
+        )
+        if missing_names:
+            preview_names = ", ".join(missing_names[:6])
+            suffix = " ..." if len(missing_names) > 6 else ""
+            st.caption(f"Missing ({len(missing_names)}): {preview_names}{suffix}")
+
+        ok_col, cancel_col = st.columns(2)
+        if ok_col.button("OK", use_container_width=True, key="pid_param_fetch_prompt_ok"):
+            state.param_op_queue.put({"action": "request_list"})
+            st.session_state["pid_param_fetch_prompt_open"] = False
+            st.toast("Parameter list request sent")
+            st.rerun()
+        if cancel_col.button("Cancel", use_container_width=True, key="pid_param_fetch_prompt_cancel"):
+            st.session_state["pid_param_fetch_prompt_open"] = False
+            st.rerun()
+
+    if st.session_state.get("pid_param_fetch_prompt_open", False):
+        _show_param_fetch_prompt(missing_param_names)
 
     llm_output_text = str(st.session_state.get("pid_llm_result") or "")
     llm_reasoning_text = str(st.session_state.get("pid_llm_reasoning") or "")
@@ -956,7 +1068,6 @@ with st.container(border=True):
         st.session_state["pid_param_table_llm_signature"] = llm_refresh_signature
 
     rows = []
-    visible_groups = _filter_param_groups_for_mask(mask_info)
     if not visible_groups:
         st.info("No parameter groups are enabled by current GCS_PID_MASK.")
 
@@ -1011,8 +1122,12 @@ with st.container(border=True):
             disabled=["group", "param", "value", "LLM", "Reason", "updated"],
             column_config={
                 "": st.column_config.CheckboxColumn("", default=False),
+                "value": st.column_config.NumberColumn(
+                    "FC value",
+                    width="small",
+                ),
                 "LLM": st.column_config.TextColumn(
-                    "LLM",
+                    "AI value",
                     help="LLM-recommended numeric value",
                     width="small",
                 ),
